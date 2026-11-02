@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Основной коллектор прокси-серверов"""
+"""Основной коллектор прокси-серверов с встроенными источниками"""
 
 import base64
 import hashlib
@@ -82,6 +82,7 @@ CHECK_TCP = env_bool('CHECK_TCP', True)
 CHECK_CORES = env_bool('CHECK_CORES', True)
 ENABLE_GEO = env_bool('ENABLE_GEO', True)
 ENABLE_GITHUB_SEARCH = env_bool('ENABLE_GITHUB_SEARCH', True)
+ENABLE_TELEGRAM_WEB = env_bool('ENABLE_TELEGRAM_WEB', True)
 
 # =========================
 # Filters
@@ -95,7 +96,42 @@ ALLOW_PLAIN_VMESS = env_bool('ALLOW_PLAIN_VMESS', False)
 ALLOW_UNKNOWN_COUNTRY = env_bool('ALLOW_UNKNOWN_COUNTRY', False)
 
 # =========================
-# Sources
+# ВСТРОЕННЫЕ ИСТОЧНИКИ
+# =========================
+BUILTIN_GITHUB_REPOS = [
+    'sashulik-ww/Collector-v5',
+    'barry-far/V2ray-Config',
+    'nikita29a/FreeProxyList',
+    'igareck/vpn-configs-for-russia',
+    'peasoft/NoMoreWalls',
+    'aiboboxx/v2rayfree',
+    'learnhard-cn/free_proxy_ss',
+    'freefq/free',
+    'Pawdroid/Free-servers',
+    'ermaozi/get_subscribe',
+    'zhangkaiit/FreeProxy',
+    'w1770946466/Auto_proxy',
+    'tbbatbb/Proxy',
+    'vveg26/getProxy',
+    'xsro/free',
+]
+
+BUILTIN_TELEGRAM_CHANNELS = [
+    'V2ray_Collector',
+    'OutlineReleasedKey',
+    'v2ray_configs_pool',
+    'V2rayNG3',
+    'VmessProtocol',
+    'DailyV2RY',
+    'v2rayng_config_amin',
+    'V2rayCollectorDonate',
+    'prrofile_purple',
+    'shadowproxy66',
+    'V2rayCollector',
+]
+
+# =========================
+# Sources from files
 # =========================
 SEARCH_QUERIES = read_lines(BASE_DIR / 'sources' / 'search_queries.txt') or [
     '"vless://"',
@@ -109,24 +145,20 @@ SEARCH_QUERIES = read_lines(BASE_DIR / 'sources' / 'search_queries.txt') or [
 
 GITHUB_REPOS = read_lines(BASE_DIR / 'sources' / 'github_repos.txt') + env_list('GITHUB_REPOS')
 RAW_URLS = read_lines(BASE_DIR / 'sources' / 'raw_urls.txt') + env_list('RAW_URLS')
+TELEGRAM_CHANNELS = read_lines(BASE_DIR / 'sources' / 'telegram_channels.txt')
 
 DEFAULT_RU_SNI = [
-    'vk.com',
-    'yandex.ru',
-    'ya.ru',
-    'ozon.ru',
-    'wildberries.ru',
-    'mail.ru',
-    'gosuslugi.ru',
-    'avito.ru',
-    'sber.ru',
-    'tinkoff.ru',
+    'vk.com', 'yandex.ru', 'ya.ru', 'ozon.ru', 'wildberries.ru',
+    'mail.ru', 'gosuslugi.ru', 'avito.ru', 'sber.ru', 'tinkoff.ru',
 ]
 RU_SNI = read_lines(BASE_DIR / 'allowlists' / 'ru_sni.txt') or DEFAULT_RU_SNI
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '').strip()
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'proxy-collector/3.0', 'Accept': 'application/vnd.github+json'})
+SESSION.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+})
 if GITHUB_TOKEN:
     SESSION.headers['Authorization'] = f'Bearer {GITHUB_TOKEN}'
 
@@ -567,9 +599,6 @@ def final_sort_key(s: Dict[str, Any]):
 # =========================
 def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol: int,
                  us_ca_quota_percent: int, max_duplicate_ip: int) -> List[Dict[str, Any]]:
-    """Применяет лимиты: общий, по протоколам, по IP, квота США/Канада"""
-
-    # Фильтруем по количеству одинаковых IP
     ip_count = {}
     filtered = []
     for s in servers:
@@ -579,11 +608,8 @@ def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol
             filtered.append(s)
 
     servers = filtered
-
-    # Сортируем
     servers.sort(key=final_sort_key)
 
-    # Разделяем на США/Канада и остальные
     us_ca_servers = [s for s in servers if (s.get('country') or '').upper() in ('US', 'CA')]
     other_servers = [s for s in servers if (s.get('country') or '').upper() not in ('US', 'CA')]
 
@@ -595,7 +621,6 @@ def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol
 
     selected = us_ca_selected + other_selected
 
-    # Лимит по протоколам
     protocol_count = {}
     final_selected = []
 
@@ -612,7 +637,6 @@ def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol
 # Naming
 # =========================
 def build_name(s: Dict[str, Any]) -> str:
-    """Создаёт имя: 🇱🇹 Lithuania, Šiauliai"""
     country_code = (s.get('country') or 'UN').upper()
     country_name = s.get('country_name') or country_code
     city = s.get('city') or ''
@@ -803,7 +827,6 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
         if (s.get('country') or '').upper() == 'RU':
             russian_servers.append(s)
 
-    # Применяем лимиты
     common_servers = apply_limits(common_servers, MAX_SERVERS_TOTAL, MAX_SERVERS_PER_PROTOCOL,
                                   US_CA_QUOTA_PERCENT, MAX_DUPLICATE_IP)
 
@@ -816,14 +839,7 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
 
     russian_servers = russian_servers[:MAX_RUSSIAN]
 
-    # Создаём имена
     all_named = set()
-    for s in common_servers + whitelist_servers + russian_servers:
-        for proto_servers in by_protocol.values():
-            for ps in proto_servers:
-                if id(ps) == id(s):
-                    continue
-
     for s in common_servers + whitelist_servers + russian_servers:
         name = build_name(s)
         s['name'] = name
@@ -838,14 +854,12 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
                 s['named_raw'] = rename_link(s, name)
                 all_named.add(id(s))
 
-    # Общий файл Xray
     common_links = [s['named_raw'] for s in common_servers]
     (OUT_DIR / 'xray_links.txt').write_text('\n'.join(common_links) + '\n', encoding='utf-8')
 
     sub_b64 = base64.b64encode('\n'.join(common_links).encode('utf-8')).decode() if common_links else ''
     (OUT_DIR / 'v2rayng_subscription_b64.txt').write_text(sub_b64, encoding='utf-8')
 
-    # Общий файл sing-box
     sing_outbounds = []
     for s in common_servers:
         ob = to_singbox_outbound(s, s['name'])
@@ -855,7 +869,6 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
         json.dumps({'outbounds': sing_outbounds}, indent=2, ensure_ascii=False), encoding='utf-8'
     )
 
-    # Файлы по протоколам
     for proto, proto_servers in by_protocol.items():
         proto_links = [s['named_raw'] for s in proto_servers]
         (OUT_DIR / f'{proto}_xray.txt').write_text('\n'.join(proto_links) + '\n', encoding='utf-8')
@@ -869,15 +882,12 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
             json.dumps({'outbounds': proto_outbounds}, indent=2, ensure_ascii=False), encoding='utf-8'
         )
 
-    # Белый список
     whitelist_links = [s['named_raw'] for s in whitelist_servers]
     (OUT_DIR / 'whitelist_vless_reality_ru.txt').write_text('\n'.join(whitelist_links) + '\n', encoding='utf-8')
 
-    # Российские серверы
     russian_links = [s['named_raw'] for s in russian_servers]
     (OUT_DIR / 'russian_servers.txt').write_text('\n'.join(russian_links) + '\n', encoding='utf-8')
 
-    # Метаданные
     meta = []
     for s in servers:
         meta.append({
@@ -899,7 +909,6 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
         json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8'
     )
 
-    # Статистика
     by_proto = {}
     by_country = {}
 
@@ -935,15 +944,19 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
 # =========================
 # Source collection
 # =========================
-def http_get_text(url: str, timeout: int = 20) -> str:
-    try:
-        r = SESSION.get(url, timeout=timeout)
-        if r.status_code == 200:
-            if len(r.content) > 1_500_000:
-                return ''
-            return r.text
-    except Exception:
-        pass
+def http_get_text(url: str, timeout: int = 20, retries: int = 3) -> str:
+    for attempt in range(retries):
+        try:
+            r = SESSION.get(url, timeout=timeout)
+            if r.status_code == 200:
+                if len(r.content) > 1_500_000:
+                    return ''
+                return r.text
+            elif r.status_code in (429, 500, 502, 503, 504):
+                time.sleep(2 ** attempt)
+                continue
+        except Exception:
+            time.sleep(1)
     return ''
 
 
@@ -971,6 +984,120 @@ def path_looks_useful(path: str) -> bool:
     keywords = ('proxy', 'sub', 'subscription', 'vless', 'vmess', 'trojan', 'shadowsocks', 'ss',
                 'reality', 'node', 'nodes', 'server', 'servers', 'v2ray', 'xray', 'singbox', 'karing', 'hysteria')
     return any(k in p for k in keywords)
+
+
+def github_repo_texts(repo: str) -> List[str]:
+    texts = []
+    max_files_per_repo = env_int('MAX_FILES_PER_REPO', 200)
+
+    try:
+        repo = repo.strip().strip('/')
+        branch = None
+        if '@' in repo:
+            repo, branch = repo.split('@', 1)
+
+        info = http_get_json(f'https://api.github.com/repos/{repo}')
+        if not info or 'default_branch' not in info:
+            print(f'[WARN] Cannot access repo: {repo}')
+            return []
+
+        branch = branch or info.get('default_branch', 'main')
+        tree = http_get_json(f'https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1')
+        if not tree:
+            return []
+
+        count = 0
+        for obj in tree.get('tree', []):
+            if obj.get('type') != 'blob':
+                continue
+
+            path = obj.get('path', '')
+            size = obj.get('size', 0)
+            if size > 1_500_000:
+                continue
+
+            if not path_looks_useful(path):
+                continue
+
+            raw_url = f'https://raw.githubusercontent.com/{repo}/{branch}/{urllib.parse.quote(path)}'
+            txt = http_get_text(raw_url)
+            if txt:
+                texts.append(txt)
+
+            count += 1
+            if count >= max_files_per_repo:
+                break
+            time.sleep(0.2)
+    except Exception as e:
+        print(f'[WARN] Error processing repo {repo}: {e}')
+
+    return texts
+
+
+def raw_url_texts() -> List[str]:
+    texts = []
+    for url in RAW_URLS:
+        txt = http_get_text(url)
+        if txt:
+            texts.append(txt)
+            print(f'[OK] Downloaded: {url[:80]}...')
+        else:
+            print(f'[WARN] Failed to download: {url[:80]}...')
+    return texts
+
+
+def local_text_files() -> List[str]:
+    texts = []
+    d = BASE_DIR / 'sources' / 'texts'
+    if not d.exists():
+        return texts
+
+    for f in sorted(d.iterdir()):
+        if f.suffix.lower() in {'.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log'}:
+            try:
+                texts.append(f.read_text(encoding='utf-8', errors='ignore'))
+            except Exception:
+                pass
+
+    return texts
+
+
+def telegram_web_texts() -> List[str]:
+    """Парсит публичные Telegram каналы через веб-версию"""
+    texts = []
+    
+    # Собираем каналы из файла и встроенного списка
+    all_channels = set()
+    for ch in TELEGRAM_CHANNELS:
+        # Извлекаем имя канала из URL
+        ch = ch.strip()
+        if 't.me/' in ch:
+            ch = ch.split('t.me/')[-1].strip('/')
+        if ch.startswith('@'):
+            ch = ch[1:]
+        if ch:
+            all_channels.add(ch)
+    
+    for ch in BUILTIN_TELEGRAM_CHANNELS:
+        all_channels.add(ch)
+    
+    print(f'[INFO] Parsing {len(all_channels)} Telegram channels via web...')
+    
+    for channel in all_channels:
+        url = f'https://t.me/s/{channel}'
+        try:
+            txt = http_get_text(url, timeout=15)
+            if txt:
+                texts.append(txt)
+                print(f'[OK] Telegram channel: {channel}')
+            else:
+                print(f'[WARN] Empty response for channel: {channel}')
+        except Exception as e:
+            print(f'[WARN] Error parsing channel {channel}: {e}')
+        
+        time.sleep(1)  # Задержка между запросами
+    
+    return texts
 
 
 def github_code_search_texts() -> List[str]:
@@ -1013,80 +1140,7 @@ def github_code_search_texts() -> List[str]:
     return texts
 
 
-def github_repo_texts() -> List[str]:
-    texts = []
-    max_files_per_repo = env_int('MAX_FILES_PER_REPO', 200)
-
-    for item in GITHUB_REPOS:
-        try:
-            repo = item.strip().strip('/')
-            branch = None
-            if '@' in repo:
-                repo, branch = repo.split('@', 1)
-
-            info = http_get_json(f'https://api.github.com/repos/{repo}')
-            if not info or 'default_branch' not in info:
-                continue
-
-            branch = branch or info.get('default_branch', 'main')
-            tree = http_get_json(f'https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1')
-            if not tree:
-                continue
-
-            count = 0
-            for obj in tree.get('tree', []):
-                if obj.get('type') != 'blob':
-                    continue
-
-                path = obj.get('path', '')
-                size = obj.get('size', 0)
-                if size > 1_500_000:
-                    continue
-
-                if not path_looks_useful(path):
-                    continue
-
-                raw_url = f'https://raw.githubusercontent.com/{repo}/{branch}/{urllib.parse.quote(path)}'
-                txt = http_get_text(raw_url)
-                if txt:
-                    texts.append(txt)
-
-                count += 1
-                if count >= max_files_per_repo:
-                    break
-                time.sleep(0.2)
-        except Exception:
-            continue
-
-    return texts
-
-
-def raw_url_texts() -> List[str]:
-    texts = []
-    for url in RAW_URLS:
-        txt = http_get_text(url)
-        if txt:
-            texts.append(txt)
-    return texts
-
-
-def local_text_files() -> List[str]:
-    texts = []
-    d = BASE_DIR / 'sources' / 'texts'
-    if not d.exists():
-        return texts
-
-    for f in sorted(d.iterdir()):
-        if f.suffix.lower() in {'.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log'}:
-            try:
-                texts.append(f.read_text(encoding='utf-8', errors='ignore'))
-            except Exception:
-                pass
-
-    return texts
-
-
-LINK_RE = re.compile(r'\b(?:vless|vmess|trojan|ss|hy2|hysteria2?|tuic|wireguard)://[^\s"\'<>`]+', re.IGNORECASE)
+LINK_RE = re.compile(r'\b(?:vless|vmess|trojan|ss|hy2|hysteria2?|tuic|wireguard)://[^\s"\'<>`\)]+', re.IGNORECASE)
 
 
 def extract_links(text: str) -> List[str]:
@@ -1108,15 +1162,42 @@ def extract_links(text: str) -> List[str]:
 def collect_texts() -> List[str]:
     texts = []
 
-    texts.extend(local_text_files())
+    # 1. Локальные файлы
+    print('[INFO] Reading local text files...')
+    local = local_text_files()
+    print(f'[INFO] Local texts: {len(local)}')
+    texts.extend(local)
 
+    # 2. Raw URLs
+    print('[INFO] Downloading raw URLs...')
+    raw = raw_url_texts()
+    print(f'[INFO] Raw URL texts: {len(raw)}')
+    texts.extend(raw)
+
+    # 3. Встроенные GitHub репозитории
+    print('[INFO] Scanning built-in GitHub repos...')
+    all_repos = list(set(BUILTIN_GITHUB_REPOS + GITHUB_REPOS))
+    for repo in all_repos:
+        repo_texts = github_repo_texts(repo)
+        if repo_texts:
+            texts.extend(repo_texts)
+            print(f'[OK] Repo {repo}: {len(repo_texts)} texts')
+        else:
+            print(f'[WARN] Repo {repo}: no texts')
+
+    # 4. Telegram через веб
+    if ENABLE_TELEGRAM_WEB:
+        print('[INFO] Parsing Telegram channels via web...')
+        tg_texts = telegram_web_texts()
+        print(f'[INFO] Telegram texts: {len(tg_texts)}')
+        texts.extend(tg_texts)
+
+    # 5. GitHub Code Search
     if ENABLE_GITHUB_SEARCH:
-        texts.extend(github_code_search_texts())
-
-    if GITHUB_TOKEN and GITHUB_REPOS:
-        texts.extend(github_repo_texts())
-
-    texts.extend(raw_url_texts())
+        print('[INFO] GitHub Code Search...')
+        search_texts = github_code_search_texts()
+        print(f'[INFO] Search texts: {len(search_texts)}')
+        texts.extend(search_texts)
 
     return texts
 
@@ -1127,7 +1208,7 @@ def collect_texts() -> List[str]:
 def main():
     print('[INFO] Collecting source texts...')
     texts = collect_texts()
-    print(f'[INFO] Source texts: {len(texts)}')
+    print(f'[INFO] Total source texts: {len(texts)}')
 
     links = []
     for t in texts:
