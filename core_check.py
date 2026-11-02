@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Реальная проверка через Xray и sing-box"""
+
 import json
 import os
 import shutil
@@ -5,7 +8,8 @@ import socket
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
 
 try:
     import collector
@@ -26,9 +30,10 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-TEST_URL = os.environ.get('CORE_TEST_URL', 'https://www.gstatic.com/generate_204')
-TIMEOUT = env_int('CORE_CHECK_TIMEOUT', 8)
-SAMPLE = env_int('CORE_CHECK_SAMPLE', 20)
+TEST_URL = os.environ.get('CORE_TEST_URL', 'https://www.google.com/generate_204')
+TIMEOUT = env_int('CORE_CHECK_TIMEOUT', 10)
+WORKERS = env_int('CORE_CHECK_WORKERS', 20)
+SAMPLE = env_int('CORE_CHECK_SAMPLE', 0)
 REQUIRED = env_bool('CORE_CHECK_REQUIRED', False)
 CORES = {x.strip().lower() for x in os.environ.get('CORE_CHECK_CORES', 'xray,singbox').split(',') if x.strip()}
 
@@ -47,7 +52,7 @@ def get_free_port() -> int:
         return s.getsockname()[1]
 
 
-def wait_port(port: int, timeout: float = 5.0) -> bool:
+def wait_port(port: int, timeout: float = 8.0) -> bool:
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -58,34 +63,56 @@ def wait_port(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def curl_ok(port: int) -> bool:
+def curl_test(port: int) -> Dict[str, Any]:
+    """Тестируем соединение через прокси"""
     curl = shutil.which('curl')
     if not curl:
-        return False
+        return {'success': False, 'error': 'curl not found'}
 
     cmd = [
         curl,
         '-s',
         '-o', '/dev/null',
-        '-w', '%{http_code}',
+        '-w', '%{http_code} %{time_total} %{speed_download}',
         '--max-time', str(TIMEOUT),
         '--socks5-hostname', f'127.0.0.1:{port}',
         TEST_URL,
     ]
 
     try:
+        start = time.time()
         out = subprocess.check_output(
             cmd,
             stderr=subprocess.DEVNULL,
             timeout=TIMEOUT + 5
         ).decode().strip()
 
-        return out in {'200', '204', '301', '302', '303', '307', '308'}
-    except Exception:
-        return False
+        elapsed = time.time() - start
+        parts = out.split()
+
+        if len(parts) >= 3:
+            http_code = parts[0]
+            time_total = float(parts[1])
+            speed = float(parts[2]) / 1024  # KB/s
+
+            success = http_code in {'200', '204', '301', '302', '303', '307', '308'}
+
+            return {
+                'success': success,
+                'http_code': http_code,
+                'time_total': time_total,
+                'speed_kbps': speed,
+                'elapsed': elapsed
+            }
+    except subprocess.TimeoutExpired:
+        return {'success': False, 'error': 'timeout'}
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
+
+    return {'success': False, 'error': 'unknown'}
 
 
-def run_binary_with_config(cmd: List[str], cfg: Dict[str, Any], port: int) -> bool:
+def run_binary_with_config(cmd: List[str], cfg: Dict[str, Any], port: int) -> Dict[str, Any]:
     tmp = None
     proc = None
 
@@ -100,13 +127,14 @@ def run_binary_with_config(cmd: List[str], cfg: Dict[str, Any], port: int) -> bo
             stderr=subprocess.DEVNULL
         )
 
-        if not wait_port(port, 5.0):
-            return False
+        if not wait_port(port, 8.0):
+            return {'success': False, 'error': 'port not ready'}
 
-        return curl_ok(port)
+        result = curl_test(port)
+        return result
 
-    except Exception:
-        return False
+    except Exception as e:
+        return {'success': False, 'error': str(e)}
 
     finally:
         if proc:
@@ -234,6 +262,25 @@ def xray_outbound(s: Dict[str, Any]) -> Dict[str, Any]:
             }
         }
 
+    if proto == 'hysteria2':
+        return {
+            'protocol': 'hysteria2',
+            'settings': {
+                'servers': [{
+                    'address': s['address'],
+                    'port': s['port'],
+                    'password': s.get('password'),
+                }]
+            },
+            'streamSettings': {
+                'security': 'tls',
+                'tlsSettings': {
+                    'serverName': s.get('sni') or s.get('host') or s.get('address'),
+                    'allowInsecure': True,
+                }
+            }
+        }
+
     return {}
 
 
@@ -302,30 +349,56 @@ def singbox_config(s: Dict[str, Any], port: int) -> Dict[str, Any]:
     }
 
 
-def check_xray(s: Dict[str, Any]) -> bool:
+def check_xray(s: Dict[str, Any]) -> Dict[str, Any]:
     binary = xray_binary()
     if not binary:
-        return False
+        return {'success': False, 'error': 'xray not found'}
 
     cfg = xray_config(s, get_free_port())
     if not cfg:
-        return False
+        return {'success': False, 'error': 'config failed'}
 
     port = cfg['inbounds'][0]['port']
     return run_binary_with_config([binary, 'run', '-c'], cfg, port)
 
 
-def check_singbox(s: Dict[str, Any]) -> bool:
+def check_singbox(s: Dict[str, Any]) -> Dict[str, Any]:
     binary = singbox_binary()
     if not binary:
-        return False
+        return {'success': False, 'error': 'singbox not found'}
 
     cfg = singbox_config(s, get_free_port())
     if not cfg:
-        return False
+        return {'success': False, 'error': 'config failed'}
 
     port = cfg['inbounds'][0]['listen_port']
     return run_binary_with_config([binary, 'run', '-c'], cfg, port)
+
+
+def check_server(s: Dict[str, Any]) -> Dict[str, Any]:
+    """Проверяет сервер через Xray и sing-box"""
+    results = {
+        'xray': None,
+        'singbox': None,
+        'passed': False
+    }
+
+    if 'xray' in CORES:
+        results['xray'] = check_xray(s)
+
+    if 'singbox' in CORES:
+        results['singbox'] = check_singbox(s)
+
+    if 'xray' in CORES and results['xray'] and results['xray'].get('success'):
+        results['passed'] = True
+        results['speed_kbps'] = results['xray'].get('speed_kbps', 0)
+        results['time_total'] = results['xray'].get('time_total', 0)
+    elif 'singbox' in CORES and results['singbox'] and results['singbox'].get('success'):
+        results['passed'] = True
+        results['speed_kbps'] = results['singbox'].get('speed_kbps', 0)
+        results['time_total'] = results['singbox'].get('time_total', 0)
+
+    return results
 
 
 def filter_by_core_checks(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -345,20 +418,30 @@ def filter_by_core_checks(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
     sample = servers[:SAMPLE] if SAMPLE > 0 else servers
     passed = []
+    total = len(sample)
 
-    for s in sample:
-        ok = True
+    print(f'[CORE] Starting core check for {total} servers using {", ".join(active)}')
+    print(f'[CORE] Using {WORKERS} workers')
 
-        if 'xray' in active:
-            ok = ok and check_xray(s)
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(check_server, s): s for s in sample}
 
-        if ok and 'singbox' in active:
-            ok = ok and check_singbox(s)
+        done_count = 0
+        for f in as_completed(futures):
+            s = futures[f]
+            result = f.result()
+            done_count += 1
 
-        s['core_check_passed'] = ok
+            if done_count % 50 == 0:
+                print(f'[CORE] Progress: {done_count}/{total} ({done_count * 100 // total}%)')
 
-        if ok:
-            passed.append(s)
+            if result['passed']:
+                s['core_check_passed'] = True
+                s['speed_kbps'] = result.get('speed_kbps', 0)
+                s['time_total'] = result.get('time_total', 0)
+                passed.append(s)
+
+    print(f'[CORE] Core check passed: {len(passed)}/{total} servers')
 
     if REQUIRED:
         return passed
