@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Утилиты для определения страны и города через несколько сервисов"""
 
+import os
 import socket
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
 
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'proxy-collector/2.0'})
+SESSION.headers.update({'User-Agent': 'proxy-collector/3.0'})
 
-# Кэш для IP-геолокации
 _GEO_CACHE: Dict[str, Dict[str, Any]] = {}
 _GEO_LOCK = threading.Lock()
+
+GEO_WORKERS = int(os.environ.get('GEO_WORKERS', '30'))
 
 
 def resolve_ip(host: str) -> Optional[str]:
@@ -100,41 +104,72 @@ def get_geo_ipinfo(ip: str) -> Tuple[str, str, str]:
     return 'UN', '', ''
 
 
-def get_geo(ip: str) -> Tuple[str, str, str]:
-    """
-    Получаем геолокацию через несколько сервисов, возвращаем наиболее точные данные.
-    Возвращает: (country_code, city, country_name)
-    """
-    global _GEO_CACHE
-    
-    with _GEO_LOCK:
-        if ip in _GEO_CACHE:
-            cached = _GEO_CACHE[ip]
-            if time.time() - cached.get('ts', 0) < 3600 * 24:  # кэш на 24 часа
-                return cached.get('country', 'UN'), cached.get('city', ''), cached.get('country_name', '')
-    
-    # Пробуем несколько сервисов
+def get_geo_single(ip: str) -> Tuple[str, str, str]:
+    """Проверяет один IP через несколько сервисов"""
     country, city, country_name = get_geo_ipwho(ip)
     if country != 'UN':
-        result = (country, city, country_name)
-    else:
-        country, city, country_name = get_geo_ipapi(ip)
-        if country != 'UN':
-            result = (country, city, country_name)
-        else:
-            country, city, country_name = get_geo_ipinfo(ip)
-            result = (country, city, country_name)
-    
-    # Кэшируем результат
+        return country, city, country_name
+
+    country, city, country_name = get_geo_ipapi(ip)
+    if country != 'UN':
+        return country, city, country_name
+
+    country, city, country_name = get_geo_ipinfo(ip)
+    return country, city, country_name
+
+
+def get_geo_batch(ips: List[str]) -> Dict[str, Tuple[str, str, str]]:
+    """Многопоточная проверка списка IP"""
+    results = {}
+
+    to_check = []
     with _GEO_LOCK:
-        _GEO_CACHE[ip] = {
-            'country': result[0],
-            'city': result[1],
-            'country_name': result[2],
-            'ts': time.time()
-        }
-    
-    return result
+        for ip in ips:
+            if ip in _GEO_CACHE:
+                cached = _GEO_CACHE[ip]
+                if time.time() - cached.get('ts', 0) < 3600 * 24:
+                    results[ip] = (cached.get('country', 'UN'), cached.get('city', ''), cached.get('country_name', ''))
+                else:
+                    to_check.append(ip)
+            else:
+                to_check.append(ip)
+
+    if not to_check:
+        return results
+
+    print(f'[GEO] Checking {len(to_check)} IPs with {GEO_WORKERS} workers')
+
+    with ThreadPoolExecutor(max_workers=GEO_WORKERS) as ex:
+        futures = {ex.submit(get_geo_single, ip): ip for ip in to_check}
+
+        done_count = 0
+        for f in as_completed(futures):
+            ip = futures[f]
+            try:
+                result = f.result()
+                results[ip] = result
+
+                with _GEO_LOCK:
+                    _GEO_CACHE[ip] = {
+                        'country': result[0],
+                        'city': result[1],
+                        'country_name': result[2],
+                        'ts': time.time()
+                    }
+
+                done_count += 1
+                if done_count % 100 == 0:
+                    print(f'[GEO] Progress: {done_count}/{len(to_check)} ({done_count * 100 // len(to_check)}%)')
+            except Exception:
+                results[ip] = ('UN', '', '')
+
+    return results
+
+
+def get_geo(ip: str) -> Tuple[str, str, str]:
+    """Получаем геолокацию для одного IP"""
+    results = get_geo_batch([ip])
+    return results.get(ip, ('UN', '', ''))
 
 
 COUNTRY_FLAGS = {
