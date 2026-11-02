@@ -3,9 +3,8 @@ name: collect-proxies
 on:
   workflow_dispatch:
   schedule:
-    # каждые 1.5 часа: чётные часы в :00, нечётные в :30
-    - cron: "0 0,2,4,6,8,10,12,14,16,18,20,22 * * *"
-    - cron: "30 1,3,5,7,9,11,13,15,17,19,21,23 * * *"
+    # каждые 1.5 часа (90 минут)
+    - cron: "*/90 * * * *"
 
 permissions:
   contents: write
@@ -15,21 +14,35 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
+      # Лимиты
       MAX_SERVERS_TOTAL: "600"
       MAX_SERVERS_PER_PROTOCOL: "250"
       MAX_WHITELIST: "300"
       MAX_RUSSIAN: "250"
       MAX_DUPLICATE_IP: "2"
       MAX_DUPLICATE_IP_WHITELIST: "3"
+      
+      # Квоты
       US_CA_QUOTA_PERCENT: "30"
+      
+      # Параметры проверки
       MAX_LATENCY_MS: "1500"
       CHECK_TCP: "true"
       CHECK_CORES: "true"
-      CHECK_SPEED: "true"
+      CHECK_SPEED: "false"
       MIN_SPEED_MBPS: "5"
+      
+      # Workers
+      TCP_WORKERS: "50"
+      GEO_WORKERS: "30"
+      CORE_CHECK_WORKERS: "20"
+      
+      # Протоколы
       ALLOWED_PROTOCOLS: "vless,vmess,trojan,hysteria2,shadowsocks"
       COMMON_FILE_PROTOCOLS: "vless,vmess,trojan,hysteria2"
       BLOCKED_PROTOCOLS: "tuic,wireguard,socks,socks5,http,https"
+      
+      # Фильтры
       REQUIRE_ENCRYPTED: "true"
       ALLOW_PLAIN_VMESS: "false"
       BLOCKED_NETWORKS: "quic"
@@ -46,44 +59,45 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests speedtest-cli
 
       - name: Install Xray
-        continue-on-error: true
         run: |
-          TAG=$(curl -sfL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
-          echo "Xray version: $TAG"
-          curl -sfL -o xray.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-linux-64.zip"
-          mkdir -p xray-bin
+          echo "[INFO] Downloading Xray..."
+          curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
           unzip -q xray.zip -d xray-bin
           chmod +x xray-bin/xray
-          echo "${GITHUB_WORKSPACE}/xray-bin" >> "$GITHUB_PATH"
+          echo "$(pwd)/xray-bin" >> $GITHUB_PATH
+          echo "[OK] Xray installed"
 
       - name: Install sing-box
-        continue-on-error: true
         run: |
-          TAG=$(curl -sfL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)
-          VER="${TAG#v}"
-          echo "sing-box version: $TAG (dir: $VER)"
-          curl -sfL -o singbox.tar.gz "https://github.com/SagerNet/sing-box/releases/download/${TAG}/sing-box-${VER}-linux-amd64.tar.gz"
-          if tar -xzf singbox.tar.gz; then
-            mv "sing-box-${VER}-linux-amd64/sing-box" ./sing-box
-            chmod +x ./sing-box
-            echo "${GITHUB_WORKSPACE}" >> "$GITHUB_PATH"
-          else
-            echo "Asset not found, trying official install script..."
-            curl -fsSL https://sing-box.app/deb-install.sh | sudo bash -
-          fi
+          echo "[INFO] Downloading sing-box..."
+          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
+          VERSION=${VERSION#v}
+          curl -sL https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz -o singbox.tar.gz
+          tar -xzf singbox.tar.gz
+          find . -name "sing-box" -type f -exec chmod +x {} \;
+          find . -name "sing-box" -type f -exec dirname {} \; | head -1 >> $GITHUB_PATH
+          echo "[OK] sing-box installed"
 
       - name: Verify binaries
         run: |
-          which xray && xray version || echo "WARN: xray not available"
-          which sing-box && sing-box version || echo "WARN: sing-box not available"
+          echo "[INFO] Checking binaries..."
+          which xray || echo "[ERROR] xray not found"
+          which sing-box || echo "[ERROR] sing-box not found"
+          xray version || true
+          sing-box version || true
+
+      - name: Test collector
+        run: |
+          python test_collector.py
 
       - name: Run collector
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python collector.py
+        run: |
+          python collector.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
