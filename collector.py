@@ -7,8 +7,6 @@ import json
 import os
 import re
 import socket
-import subprocess
-import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,10 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-# Импортируем утилиты
 from geo_utils import get_geo_batch, get_flag, resolve_ip, is_public_ip
 
-# Константы
 TRUE = {'1', 'true', 'yes', 'on'}
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = BASE_DIR / os.environ.get('OUT_DIR', 'out')
@@ -81,13 +77,10 @@ US_CA_QUOTA_PERCENT = env_int('US_CA_QUOTA_PERCENT', 30)
 MAX_LATENCY_MS = env_int('MAX_LATENCY_MS', 1500)
 TCP_TIMEOUT = float(os.environ.get('TCP_TIMEOUT', '3.0'))
 TCP_WORKERS = env_int('TCP_WORKERS', 50)
-TCP_MAX_CANDIDATES = env_int('TCP_MAX_CANDIDATES', 10000)
 
 CHECK_TCP = env_bool('CHECK_TCP', True)
 CHECK_CORES = env_bool('CHECK_CORES', True)
-CHECK_SPEED = env_bool('CHECK_SPEED', False)
-MIN_SPEED_MBPS = env_int('MIN_SPEED_MBPS', 5)
-
+ENABLE_GEO = env_bool('ENABLE_GEO', True)
 ENABLE_GITHUB_SEARCH = env_bool('ENABLE_GITHUB_SEARCH', True)
 
 # =========================
@@ -99,29 +92,47 @@ BLOCKED_PROTOCOLS = env_set('BLOCKED_PROTOCOLS', 'tuic,wireguard,socks,socks5,ht
 BLOCKED_NETWORKS = env_set('BLOCKED_NETWORKS', 'quic')
 REQUIRE_ENCRYPTED = env_bool('REQUIRE_ENCRYPTED', True)
 ALLOW_PLAIN_VMESS = env_bool('ALLOW_PLAIN_VMESS', False)
+ALLOW_UNKNOWN_COUNTRY = env_bool('ALLOW_UNKNOWN_COUNTRY', False)
 
 # =========================
 # Sources
 # =========================
 SEARCH_QUERIES = read_lines(BASE_DIR / 'sources' / 'search_queries.txt') or [
-    '"vless://"', '"vmess://"', '"trojan://"', '"ss://"', '"hysteria2://"', '"vless reality"'
+    '"vless://"',
+    '"vmess://"',
+    '"trojan://"',
+    '"ss://"',
+    '"hysteria2://"',
+    '"hy2://"',
+    '"vless reality"',
 ]
 
 GITHUB_REPOS = read_lines(BASE_DIR / 'sources' / 'github_repos.txt') + env_list('GITHUB_REPOS')
 RAW_URLS = read_lines(BASE_DIR / 'sources' / 'raw_urls.txt') + env_list('RAW_URLS')
 
-DEFAULT_RU_SNI = ['vk.com', 'yandex.ru', 'ya.ru', 'ozon.ru', 'wildberries.ru', 'mail.ru', 'gosuslugi.ru', 'avito.ru']
+DEFAULT_RU_SNI = [
+    'vk.com',
+    'yandex.ru',
+    'ya.ru',
+    'ozon.ru',
+    'wildberries.ru',
+    'mail.ru',
+    'gosuslugi.ru',
+    'avito.ru',
+    'sber.ru',
+    'tinkoff.ru',
+]
 RU_SNI = read_lines(BASE_DIR / 'allowlists' / 'ru_sni.txt') or DEFAULT_RU_SNI
 
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN', '').strip()
 SESSION = requests.Session()
-SESSION.headers.update({'User-Agent': 'proxy-collector/2.0', 'Accept': 'application/vnd.github+json'})
+SESSION.headers.update({'User-Agent': 'proxy-collector/3.0', 'Accept': 'application/vnd.github+json'})
 if GITHUB_TOKEN:
     SESSION.headers['Authorization'] = f'Bearer {GITHUB_TOKEN}'
 
 
 # =========================
-# Parсинг URL
+# Parsing helpers
 # =========================
 def parse_qs(query: str) -> Dict[str, List[str]]:
     return urllib.parse.parse_qs(query, keep_blank_values=True)
@@ -132,11 +143,11 @@ def q_get(qs: Dict[str, List[str]], key: str, default: Optional[str] = None) -> 
     return vals[0] if vals else default
 
 
-def split_host_port(value: str, default_port: int) -> tuple:
+def split_host_port(value: str, default_port: int) -> Tuple[str, int]:
     value = value.strip()
     if not value:
         return '', default_port
-    
+
     if value.startswith('['):
         host, _, rest = value.partition(']')
         host = host[1:]
@@ -144,14 +155,14 @@ def split_host_port(value: str, default_port: int) -> tuple:
         if rest.startswith(':') and rest[1:].isdigit():
             port = int(rest[1:])
         return host, port
-    
+
     if value.count(':') > 1:
         return value, default_port
-    
+
     host, _, port_s = value.partition(':')
     if port_s.isdigit():
         return host, int(port_s)
-    
+
     return host, default_port
 
 
@@ -164,21 +175,24 @@ def b64decode_any(value: str) -> str:
     return base64.b64decode(value).decode('utf-8', errors='ignore')
 
 
+# =========================
+# Parsers
+# =========================
 def parse_vless(url: str) -> Optional[Dict[str, Any]]:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme.lower() != 'vless' or '@' not in parts.netloc:
         return None
-    
+
     uuid, hostport = parts.netloc.rsplit('@', 1)
     host, port = split_host_port(hostport, 443)
     if not host:
         return None
-    
+
     qs = parse_qs(parts.query)
     security = q_get(qs, 'security', 'none') or 'none'
     sni = q_get(qs, 'sni') or q_get(qs, 'serverName') or q_get(qs, 'peer')
     network = q_get(qs, 'type', 'tcp') or 'tcp'
-    
+
     return {
         'protocol': 'vless',
         'address': host,
@@ -201,26 +215,26 @@ def parse_vless(url: str) -> Optional[Dict[str, Any]]:
 def parse_vmess(url: str) -> Optional[Dict[str, Any]]:
     if not url.lower().startswith('vmess://'):
         return None
-    
+
     b64 = url[len('vmess://'):].strip()
     try:
         decoded = b64decode_any(b64)
         data = json.loads(decoded)
     except Exception:
         return None
-    
+
     host = data.get('add')
     if not host:
         return None
-    
+
     try:
         port = int(data.get('port', 443))
     except Exception:
         port = 443
-    
+
     security = 'tls' if str(data.get('tls', '')).lower() == 'tls' else 'none'
     network = str(data.get('net', 'tcp')).lower()
-    
+
     return {
         'protocol': 'vmess',
         'address': host,
@@ -243,17 +257,17 @@ def parse_trojan(url: str) -> Optional[Dict[str, Any]]:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme.lower() != 'trojan' or '@' not in parts.netloc:
         return None
-    
+
     password, hostport = parts.netloc.rsplit('@', 1)
     host, port = split_host_port(hostport, 443)
     if not host:
         return None
-    
+
     qs = parse_qs(parts.query)
     security = q_get(qs, 'security', 'tls') or 'tls'
     sni = q_get(qs, 'sni') or q_get(qs, 'peer')
     network = q_get(qs, 'type', 'tcp') or 'tcp'
-    
+
     return {
         'protocol': 'trojan',
         'address': host,
@@ -272,23 +286,23 @@ def parse_trojan(url: str) -> Optional[Dict[str, Any]]:
 def parse_ss(url: str) -> Optional[Dict[str, Any]]:
     if not url.lower().startswith('ss://'):
         return None
-    
+
     full = url[len('ss://'):]
     frag_raw = ''
     query_raw = ''
-    
+
     if '#' in full:
         full, frag_raw = full.split('#', 1)
-    
+
     if '?' in full:
         full, query_raw = full.split('?', 1)
-    
+
     frag = urllib.parse.unquote(frag_raw)
     qs = parse_qs(query_raw)
-    
+
     userinfo = ''
     hostport = ''
-    
+
     if '@' in full:
         userinfo, hostport = full.rsplit('@', 1)
         if '%' in userinfo:
@@ -306,15 +320,15 @@ def parse_ss(url: str) -> Optional[Dict[str, Any]]:
         if '@' not in decoded:
             return None
         userinfo, hostport = decoded.rsplit('@', 1)
-    
+
     if ':' not in userinfo:
         return None
-    
+
     method, password = userinfo.split(':', 1)
     host, port = split_host_port(hostport, 8388)
     if not host:
         return None
-    
+
     return {
         'protocol': 'shadowsocks',
         'address': host,
@@ -336,15 +350,15 @@ def parse_hysteria2(url: str) -> Optional[Dict[str, Any]]:
     parts = urllib.parse.urlsplit(url)
     if parts.scheme.lower() not in ('hysteria2', 'hy2') or '@' not in parts.netloc:
         return None
-    
+
     password, hostport = parts.netloc.rsplit('@', 1)
     host, port = split_host_port(hostport, 443)
     if not host:
         return None
-    
+
     qs = parse_qs(parts.query)
     sni = q_get(qs, 'sni') or q_get(qs, 'peer')
-    
+
     return {
         'protocol': 'hysteria2',
         'address': host,
@@ -365,10 +379,10 @@ def parse_proxy_url(url: str) -> Optional[Dict[str, Any]]:
         scheme = urllib.parse.urlsplit(url).scheme.lower()
     except Exception:
         return None
-    
+
     if scheme in BLOCKED_PROTOCOLS:
         return None
-    
+
     try:
         if scheme == 'vless':
             s = parse_vless(url)
@@ -384,18 +398,18 @@ def parse_proxy_url(url: str) -> Optional[Dict[str, Any]]:
             return None
     except Exception:
         return None
-    
+
     if not s or not s.get('address') or not s.get('port'):
         return None
-    
+
     if s['protocol'] not in ALLOWED_PROTOCOLS:
         return None
-    
+
     return s
 
 
 # =========================
-# Фильтры и проверки
+# Deduplication
 # =========================
 def make_fingerprint(s: Dict[str, Any]) -> str:
     identity = ''
@@ -405,7 +419,7 @@ def make_fingerprint(s: Dict[str, Any]) -> str:
         identity = s.get('password') or ''
     elif s['protocol'] == 'shadowsocks':
         identity = f"{s.get('method', '')}:{s.get('password', '')}"
-    
+
     key = '|'.join([
         s['protocol'],
         s['address'].lower(),
@@ -418,49 +432,54 @@ def make_fingerprint(s: Dict[str, Any]) -> str:
         str(s.get('flow') or ''),
         str(s.get('pbk') or ''),
     ])
-    
+
     return hashlib.sha1(key.encode('utf-8')).hexdigest()
 
 
+# =========================
+# Filters
+# =========================
 def is_ru_reality(s: Dict[str, Any]) -> bool:
     if s.get('protocol') != 'vless' or s.get('security') != 'reality':
         return False
-    
+
     sni = (s.get('sni') or s.get('host') or '').lower()
     if not sni:
         return False
-    
+
     for domain in RU_SNI:
         d = domain.lower().strip()
         if not d:
             continue
         if sni == d or sni.endswith('.' + d):
             return True
-    
+
     return False
 
 
 def passes_filters(s: Dict[str, Any]) -> bool:
     if s['protocol'] not in ALLOWED_PROTOCOLS:
         return False
-    
+
     if (s.get('network') or '').lower() in BLOCKED_NETWORKS:
         return False
-    
+
     if REQUIRE_ENCRYPTED:
         if s['protocol'] in ('vless', 'trojan') and s.get('security') not in ('tls', 'reality'):
             return False
         if s['protocol'] == 'vmess' and not ALLOW_PLAIN_VMESS and s.get('security') != 'tls':
             return False
-    
+
     country = (s.get('country') or 'UN').upper()
-    
-    if country == 'UN':
+    if not ALLOW_UNKNOWN_COUNTRY and country == 'UN':
         return False
-    
+
     return True
 
 
+# =========================
+# TCP checks
+# =========================
 def tcp_latency(s: Dict[str, Any]) -> Optional[int]:
     try:
         start = time.perf_counter()
@@ -474,60 +493,146 @@ def tcp_latency(s: Dict[str, Any]) -> Optional[int]:
 def run_tcp_checks(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not CHECK_TCP:
         return servers
-    
+
     checked = []
     total = len(servers)
-    
-    print(f'[INFO] Starting TCP checks for {total} servers with {TCP_WORKERS} workers')
-    
+    done = 0
+
     with ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
         futures = {ex.submit(tcp_latency, s): s for s in servers}
-        
-        done_count = 0
         for f in as_completed(futures):
             s = futures[f]
             lat = f.result()
-            done_count += 1
-            
-            if done_count % 100 == 0:
-                print(f'[INFO] TCP progress: {done_count}/{total} ({done_count*100//total}%)')
-            
+            done += 1
+
+            if done % 100 == 0:
+                print(f'[TCP] Progress: {done}/{total} ({done * 100 // total}%)')
+
             if lat is None:
                 continue
+
             if lat <= MAX_LATENCY_MS:
                 s['latency_ms'] = lat
                 checked.append(s)
-    
-    print(f'[OK] TCP check passed: {len(checked)}/{total} servers')
+
     return checked
 
 
 # =========================
-# Именование серверов
+# Sorting
+# =========================
+PROTOCOL_PRIORITY = {
+    'vless': 0,
+    'trojan': 1,
+    'vmess': 2,
+    'hysteria2': 3,
+    'shadowsocks': 4,
+}
+
+
+def pre_sort_key(s: Dict[str, Any]):
+    proto = PROTOCOL_PRIORITY.get(s['protocol'], 9)
+
+    sec = s.get('security')
+    if sec == 'reality':
+        sec_rank = 0
+    elif sec == 'tls':
+        sec_rank = 1
+    elif s['protocol'] == 'shadowsocks':
+        sec_rank = 2
+    else:
+        sec_rank = 3
+
+    ru_rank = 0 if is_ru_reality(s) else 1
+    lat = s.get('latency_ms') or 999999
+
+    return (
+        proto,
+        sec_rank,
+        ru_rank,
+        lat,
+        s['address'].lower(),
+        s['port'],
+    )
+
+
+def final_sort_key(s: Dict[str, Any]):
+    lat = s.get('latency_ms') or 999999
+    speed = s.get('speed_kbps') or 0
+    return (lat, -speed, *pre_sort_key(s))
+
+
+# =========================
+# Limits
+# =========================
+def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol: int,
+                 us_ca_quota_percent: int, max_duplicate_ip: int) -> List[Dict[str, Any]]:
+    """Применяет лимиты: общий, по протоколам, по IP, квота США/Канада"""
+
+    # Фильтруем по количеству одинаковых IP
+    ip_count = {}
+    filtered = []
+    for s in servers:
+        ip = s.get('ip') or s['address']
+        ip_count[ip] = ip_count.get(ip, 0) + 1
+        if ip_count[ip] <= max_duplicate_ip:
+            filtered.append(s)
+
+    servers = filtered
+
+    # Сортируем
+    servers.sort(key=final_sort_key)
+
+    # Разделяем на США/Канада и остальные
+    us_ca_servers = [s for s in servers if (s.get('country') or '').upper() in ('US', 'CA')]
+    other_servers = [s for s in servers if (s.get('country') or '').upper() not in ('US', 'CA')]
+
+    us_ca_limit = int(max_total * us_ca_quota_percent / 100)
+    other_limit = max_total - us_ca_limit
+
+    us_ca_selected = us_ca_servers[:us_ca_limit]
+    other_selected = other_servers[:other_limit]
+
+    selected = us_ca_selected + other_selected
+
+    # Лимит по протоколам
+    protocol_count = {}
+    final_selected = []
+
+    for s in selected:
+        proto = s['protocol']
+        if protocol_count.get(proto, 0) < max_per_protocol:
+            final_selected.append(s)
+            protocol_count[proto] = protocol_count.get(proto, 0) + 1
+
+    return final_selected[:max_total]
+
+
+# =========================
+# Naming
 # =========================
 def build_name(s: Dict[str, Any]) -> str:
-    """Создаёт имя сервера в формате: 🇱🇹 Lithuania, Šiauliai"""
+    """Создаёт имя: 🇱🇹 Lithuania, Šiauliai"""
     country_code = (s.get('country') or 'UN').upper()
-    country_name = s.get('country_name', '')
-    city = s.get('city', '')
-    
+    country_name = s.get('country_name') or country_code
+    city = s.get('city') or ''
+
     flag = get_flag(country_code)
-    
-    if country_name:
+
+    if country_name and country_name != 'UN':
         name = f"{flag} {country_name}"
-        if city:
-            name += f", {city}"
     else:
         name = f"{flag} {country_code}"
-        if city:
-            name += f", {city}"
-    
+
+    if city:
+        name += f", {city}"
+
     return name
 
 
 def rename_link(s: Dict[str, Any], name: str) -> str:
     url = s.get('raw', '')
-    
+
     if s['protocol'] == 'vmess':
         data = s.get('vmess')
         if isinstance(data, dict):
@@ -539,7 +644,7 @@ def rename_link(s: Dict[str, Any], name: str) -> str:
             except Exception:
                 return url
         return url
-    
+
     try:
         parts = urllib.parse.urlsplit(url)
         return urllib.parse.urlunsplit((
@@ -554,134 +659,51 @@ def rename_link(s: Dict[str, Any], name: str) -> str:
 
 
 # =========================
-# Сортировка и выборка
-# =========================
-PROTOCOL_PRIORITY = {
-    'vless': 0,
-    'trojan': 1,
-    'vmess': 2,
-    'hysteria2': 3,
-    'shadowsocks': 4,
-}
-
-
-def pre_sort_key(s: Dict[str, Any]):
-    proto = PROTOCOL_PRIORITY.get(s['protocol'], 9)
-    
-    sec = s.get('security')
-    if sec == 'reality':
-        sec_rank = 0
-    elif sec == 'tls':
-        sec_rank = 1
-    elif s['protocol'] == 'shadowsocks':
-        sec_rank = 2
-    else:
-        sec_rank = 3
-    
-    ru_rank = 0 if is_ru_reality(s) else 1
-    
-    return (
-        proto,
-        sec_rank,
-        ru_rank,
-        s['address'].lower(),
-        s['port'],
-    )
-
-
-def final_sort_key(s: Dict[str, Any]):
-    lat = s.get('latency_ms')
-    speed = s.get('speed_kbps')
-    return (
-        lat if lat is not None else 999999,
-        -speed if speed is not None else 0,
-        *pre_sort_key(s)
-    )
-
-
-def apply_limits(servers: List[Dict[str, Any]], max_total: int, max_per_protocol: int, 
-                 us_ca_quota_percent: int, max_duplicate_ip: int) -> List[Dict[str, Any]]:
-    """Применяет все лимиты: общие, по протоколам, по IP, квоту США/Канада"""
-    
-    # Считаем IP
-    ip_count = {}
-    for s in servers:
-        ip = s['address']
-        ip_count[ip] = ip_count.get(ip, 0) + 1
-    
-    # Фильтруем по лимиту IP
-    servers = [s for s in servers if ip_count.get(s['address'], 0) <= max_duplicate_ip]
-    
-    # Сортируем
-    servers.sort(key=final_sort_key)
-    
-    # Разделяем на США/Канада и остальные
-    us_ca_servers = [s for s in servers if s.get('country', '').upper() in ('US', 'CA')]
-    other_servers = [s for s in servers if s.get('country', '').upper() not in ('US', 'CA')]
-    
-    # Вычисляем квоты
-    us_ca_limit = int(max_total * us_ca_quota_percent / 100)
-    other_limit = max_total - us_ca_limit
-    
-    # Берём серверы
-    us_ca_selected = us_ca_servers[:us_ca_limit]
-    other_selected = other_servers[:other_limit]
-    
-    # Объединяем
-    selected = us_ca_selected + other_selected
-    
-    # Применяем лимит по протоколам
-    protocol_count = {}
-    final_selected = []
-    
-    for s in selected:
-        proto = s['protocol']
-        if protocol_count.get(proto, 0) < max_per_protocol:
-            final_selected.append(s)
-            protocol_count[proto] = protocol_count.get(proto, 0) + 1
-    
-    return final_selected[:max_total]
-
-
-# =========================
-# Вывод файлов
+# Sing-box conversion
 # =========================
 def to_singbox_outbound(s: Dict[str, Any], tag: str) -> Optional[Dict[str, Any]]:
-    """Конвертирует сервер в sing-box outbound"""
     out = {
         'tag': tag,
         'server': s['address'],
         'server_port': s['port'],
     }
-    
+
     proto = s['protocol']
-    
+
     if proto == 'vless':
         out['type'] = 'vless'
         out['uuid'] = s.get('uuid')
         if s.get('flow'):
             out['flow'] = s['flow']
-        
+
         if s.get('security') in ('tls', 'reality'):
             tls = {'enabled': True, 'server_name': s.get('sni') or s.get('host') or s.get('address')}
             if s.get('security') == 'reality':
-                tls['reality'] = {'enabled': True, 'public_key': s.get('pbk'), 'short_id': s.get('sid')}
+                tls['reality'] = {'enabled': True}
+                if s.get('pbk'):
+                    tls['reality']['public_key'] = s['pbk']
+                if s.get('sid'):
+                    tls['reality']['short_id'] = s['sid']
                 if s.get('fp'):
                     tls['utls'] = {'enabled': True, 'fingerprint': s['fp']}
             else:
                 tls['insecure'] = True
             out['tls'] = tls
-        
+
         net = s.get('network')
         if net == 'ws':
-            out['transport'] = {'type': 'ws', 'path': s.get('path'), 'headers': {'Host': s.get('host')}}
+            out['transport'] = {'type': 'ws', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['headers'] = {'Host': s['host']}
         elif net == 'grpc':
             out['transport'] = {'type': 'grpc', 'service_name': s.get('path')}
         elif net in ('h2', 'http'):
-            out['transport'] = {'type': 'http', 'path': s.get('path'), 'host': [s.get('host')]}
-        
+            out['transport'] = {'type': 'http', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['host'] = [s['host']]
+
         return out
-    
+
     elif proto == 'vmess':
         out['type'] = 'vmess'
         out['uuid'] = s.get('uuid')
@@ -690,24 +712,28 @@ def to_singbox_outbound(s: Dict[str, Any], tag: str) -> Optional[Dict[str, Any]]
             out['alter_id'] = int(s.get('aid') or 0)
         except Exception:
             out['alter_id'] = 0
-        
+
         if s.get('security') == 'tls':
             out['tls'] = {
                 'enabled': True,
                 'server_name': s.get('sni') or s.get('host') or s.get('address'),
                 'insecure': True
             }
-        
+
         net = s.get('network')
         if net == 'ws':
-            out['transport'] = {'type': 'ws', 'path': s.get('path'), 'headers': {'Host': s.get('host')}}
+            out['transport'] = {'type': 'ws', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['headers'] = {'Host': s['host']}
         elif net == 'grpc':
             out['transport'] = {'type': 'grpc', 'service_name': s.get('path')}
         elif net in ('h2', 'http'):
-            out['transport'] = {'type': 'http', 'path': s.get('path'), 'host': [s.get('host')]}
-        
+            out['transport'] = {'type': 'http', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['host'] = [s['host']]
+
         return out
-    
+
     elif proto == 'trojan':
         out['type'] = 'trojan'
         out['password'] = s.get('password')
@@ -716,23 +742,27 @@ def to_singbox_outbound(s: Dict[str, Any], tag: str) -> Optional[Dict[str, Any]]
             'server_name': s.get('sni') or s.get('host') or s.get('address'),
             'insecure': True
         }
-        
+
         net = s.get('network')
         if net == 'ws':
-            out['transport'] = {'type': 'ws', 'path': s.get('path'), 'headers': {'Host': s.get('host')}}
+            out['transport'] = {'type': 'ws', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['headers'] = {'Host': s['host']}
         elif net == 'grpc':
             out['transport'] = {'type': 'grpc', 'service_name': s.get('path')}
         elif net in ('h2', 'http'):
-            out['transport'] = {'type': 'http', 'path': s.get('path'), 'host': [s.get('host')]}
-        
+            out['transport'] = {'type': 'http', 'path': s.get('path')}
+            if s.get('host'):
+                out['transport']['host'] = [s['host']]
+
         return out
-    
+
     elif proto == 'shadowsocks':
         out['type'] = 'shadowsocks'
         out['method'] = s.get('method')
         out['password'] = s.get('password')
         return out
-    
+
     elif proto == 'hysteria2':
         out['type'] = 'hysteria2'
         out['password'] = s.get('password')
@@ -742,122 +772,111 @@ def to_singbox_outbound(s: Dict[str, Any], tag: str) -> Optional[Dict[str, Any]]
             'insecure': True
         }
         return out
-    
+
     return None
 
 
+# =========================
+# Output
+# =========================
 def write_outputs(servers: List[Dict[str, Any]]) -> None:
-    """Создаёт все выходные файлы"""
     now = datetime.now(timezone.utc).isoformat()
-    
-    # Группируем серверы
+
     by_protocol = {}
     common_servers = []
     whitelist_servers = []
     russian_servers = []
-    
+
     for s in servers:
         proto = s['protocol']
-        
-        # Общий файл
+
         if proto in COMMON_FILE_PROTOCOLS:
             common_servers.append(s)
-        
-        # По протоколам
+
         if proto not in by_protocol:
             by_protocol[proto] = []
         by_protocol[proto].append(s)
-        
-        # Белый список
+
         if is_ru_reality(s):
             whitelist_servers.append(s)
-        
-        # Российские серверы
-        if s.get('country', '').upper() == 'RU':
+
+        if (s.get('country') or '').upper() == 'RU':
             russian_servers.append(s)
-    
-    # Применяем лимиты к общему файлу
-    common_servers = apply_limits(
-        common_servers, 
-        MAX_SERVERS_TOTAL, 
-        MAX_SERVERS_PER_PROTOCOL,
-        US_CA_QUOTA_PERCENT,
-        MAX_DUPLICATE_IP
-    )
-    
-    # Применяем лимиты к файлам по протоколам
-    for proto in by_protocol:
-        by_protocol[proto] = apply_limits(
-            by_protocol[proto],
-            MAX_SERVERS_TOTAL,
-            MAX_SERVERS_PER_PROTOCOL,
-            US_CA_QUOTA_PERCENT,
-            MAX_DUPLICATE_IP
-        )
-    
-    # Применяем лимиты к белому списку
-    whitelist_servers = apply_limits(
-        whitelist_servers,
-        MAX_WHITELIST,
-        MAX_WHITELIST,
-        100,
-        MAX_DUPLICATE_IP_WHITELIST
-    )
-    
-    # Применяем лимиты к российским серверам
+
+    # Применяем лимиты
+    common_servers = apply_limits(common_servers, MAX_SERVERS_TOTAL, MAX_SERVERS_PER_PROTOCOL,
+                                  US_CA_QUOTA_PERCENT, MAX_DUPLICATE_IP)
+
+    for proto in list(by_protocol.keys()):
+        by_protocol[proto] = apply_limits(by_protocol[proto], MAX_SERVERS_TOTAL, MAX_SERVERS_PER_PROTOCOL,
+                                          US_CA_QUOTA_PERCENT, MAX_DUPLICATE_IP)
+
+    whitelist_servers = apply_limits(whitelist_servers, MAX_WHITELIST, MAX_WHITELIST,
+                                     100, MAX_DUPLICATE_IP_WHITELIST)
+
     russian_servers = russian_servers[:MAX_RUSSIAN]
-    
+
     # Создаём имена
-    for s in servers + whitelist_servers + russian_servers:
+    all_named = set()
+    for s in common_servers + whitelist_servers + russian_servers:
+        for proto_servers in by_protocol.values():
+            for ps in proto_servers:
+                if id(ps) == id(s):
+                    continue
+
+    for s in common_servers + whitelist_servers + russian_servers:
         name = build_name(s)
         s['name'] = name
         s['named_raw'] = rename_link(s, name)
-    
-    # Общий файл (Xray/v2rayNG)
+        all_named.add(id(s))
+
+    for proto_servers in by_protocol.values():
+        for s in proto_servers:
+            if id(s) not in all_named:
+                name = build_name(s)
+                s['name'] = name
+                s['named_raw'] = rename_link(s, name)
+                all_named.add(id(s))
+
+    # Общий файл Xray
     common_links = [s['named_raw'] for s in common_servers]
     (OUT_DIR / 'xray_links.txt').write_text('\n'.join(common_links) + '\n', encoding='utf-8')
-    
+
     sub_b64 = base64.b64encode('\n'.join(common_links).encode('utf-8')).decode() if common_links else ''
     (OUT_DIR / 'v2rayng_subscription_b64.txt').write_text(sub_b64, encoding='utf-8')
-    
-    # Общий файл (sing-box/Karing)
+
+    # Общий файл sing-box
     sing_outbounds = []
     for s in common_servers:
         ob = to_singbox_outbound(s, s['name'])
         if ob:
             sing_outbounds.append(ob)
-    singbox_cfg = {'outbounds': sing_outbounds}
     (OUT_DIR / 'singbox_outbounds.json').write_text(
-        json.dumps(singbox_cfg, indent=2, ensure_ascii=False), encoding='utf-8'
+        json.dumps({'outbounds': sing_outbounds}, indent=2, ensure_ascii=False), encoding='utf-8'
     )
-    
+
     # Файлы по протоколам
     for proto, proto_servers in by_protocol.items():
-        # Xray
         proto_links = [s['named_raw'] for s in proto_servers]
         (OUT_DIR / f'{proto}_xray.txt').write_text('\n'.join(proto_links) + '\n', encoding='utf-8')
-        
-        # Sing-box
+
         proto_outbounds = []
         for s in proto_servers:
             ob = to_singbox_outbound(s, s['name'])
             if ob:
                 proto_outbounds.append(ob)
-        proto_cfg = {'outbounds': proto_outbounds}
         (OUT_DIR / f'{proto}_singbox.json').write_text(
-            json.dumps(proto_cfg, indent=2, ensure_ascii=False), encoding='utf-8'
+            json.dumps({'outbounds': proto_outbounds}, indent=2, ensure_ascii=False), encoding='utf-8'
         )
-    
+
     # Белый список
     whitelist_links = [s['named_raw'] for s in whitelist_servers]
-    (OUT_DIR / 'whitelist_vless_reality_ru.txt').write_text(
-        '\n'.join(whitelist_links) + '\n', encoding='utf-8'
-    )
-    
+    (OUT_DIR / 'whitelist_vless_reality_ru.txt').write_text('\n'.join(whitelist_links) + '\n', encoding='utf-8')
+
     # Российские серверы
     russian_links = [s['named_raw'] for s in russian_servers]
     (OUT_DIR / 'russian_servers.txt').write_text('\n'.join(russian_links) + '\n', encoding='utf-8')
-    
+
     # Метаданные
     meta = []
     for s in servers:
@@ -879,17 +898,17 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
     (OUT_DIR / 'servers_metadata.json').write_text(
         json.dumps(meta, indent=2, ensure_ascii=False), encoding='utf-8'
     )
-    
+
     # Статистика
     by_proto = {}
     by_country = {}
-    
+
     for s in servers:
         p = s.get('protocol', 'unknown')
         c = s.get('country', 'UN')
         by_proto[p] = by_proto.get(p, 0) + 1
         by_country[c] = by_country.get(c, 0) + 1
-    
+
     summary = {
         'generated_at': now,
         'total_selected': len(servers),
@@ -901,20 +920,20 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
         'max_servers_total': MAX_SERVERS_TOTAL,
         'us_ca_quota_percent': US_CA_QUOTA_PERCENT,
     }
-    
+
     (OUT_DIR / 'summary.json').write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8'
     )
-    
-    print(f'[OK] Created {len(common_links)} common servers')
-    print(f'[OK] Created {len(whitelist_links)} whitelist servers')
-    print(f'[OK] Created {len(russian_links)} Russian servers')
+
+    print(f'[OK] Common servers: {len(common_links)}')
+    print(f'[OK] Whitelist servers: {len(whitelist_links)}')
+    print(f'[OK] Russian servers: {len(russian_links)}')
     for proto, proto_servers in by_protocol.items():
-        print(f'[OK] Created {len(proto_servers)} {proto} servers')
+        print(f'[OK] {proto} servers: {len(proto_servers)}')
 
 
 # =========================
-# Сбор текстов
+# Source collection
 # =========================
 def http_get_text(url: str, timeout: int = 20) -> str:
     try:
@@ -949,7 +968,7 @@ def path_looks_useful(path: str) -> bool:
     allowed_ext = {'.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.conf', '.ini', '.list', '.log'}
     if any(p.endswith(ext) for ext in allowed_ext):
         return True
-    keywords = ('proxy', 'sub', 'subscription', 'vless', 'vmess', 'trojan', 'shadowsocks', 'ss', 
+    keywords = ('proxy', 'sub', 'subscription', 'vless', 'vmess', 'trojan', 'shadowsocks', 'ss',
                 'reality', 'node', 'nodes', 'server', 'servers', 'v2ray', 'xray', 'singbox', 'karing', 'hysteria')
     return any(k in p for k in keywords)
 
@@ -958,28 +977,28 @@ def github_code_search_texts() -> List[str]:
     texts = []
     if not SEARCH_QUERIES:
         return texts
-    
+
     per_page = env_int('SEARCH_PER_PAGE', 30)
     pages = env_int('SEARCH_PAGES', 2)
     items_per_query = env_int('SEARCH_ITEMS_PER_QUERY', 60)
-    
+
     if not GITHUB_TOKEN:
         print('[WARN] GITHUB_TOKEN is not set')
-    
+
     for q in SEARCH_QUERIES:
         q_final = q if 'in:' in q else f'{q} in:file'
         fetched = 0
-        
+
         for page in range(1, pages + 1):
             data = http_get_json('https://api.github.com/search/code', {'q': q_final, 'per_page': per_page, 'page': page})
             items = data.get('items', [])
             if not items:
                 break
-            
+
             for item in items:
                 if fetched >= items_per_query:
                     break
-                
+
                 raw_url = github_html_to_raw(item.get('html_url'))
                 if raw_url:
                     txt = http_get_text(raw_url)
@@ -987,58 +1006,58 @@ def github_code_search_texts() -> List[str]:
                         texts.append(txt)
                     fetched += 1
                     time.sleep(1.0)
-            
+
             if fetched >= items_per_query:
                 break
-    
+
     return texts
 
 
 def github_repo_texts() -> List[str]:
     texts = []
     max_files_per_repo = env_int('MAX_FILES_PER_REPO', 200)
-    
+
     for item in GITHUB_REPOS:
         try:
             repo = item.strip().strip('/')
             branch = None
             if '@' in repo:
                 repo, branch = repo.split('@', 1)
-            
+
             info = http_get_json(f'https://api.github.com/repos/{repo}')
             if not info or 'default_branch' not in info:
                 continue
-            
+
             branch = branch or info.get('default_branch', 'main')
             tree = http_get_json(f'https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1')
             if not tree:
                 continue
-            
+
             count = 0
             for obj in tree.get('tree', []):
                 if obj.get('type') != 'blob':
                     continue
-                
+
                 path = obj.get('path', '')
                 size = obj.get('size', 0)
                 if size > 1_500_000:
                     continue
-                
+
                 if not path_looks_useful(path):
                     continue
-                
+
                 raw_url = f'https://raw.githubusercontent.com/{repo}/{branch}/{urllib.parse.quote(path)}'
                 txt = http_get_text(raw_url)
                 if txt:
                     texts.append(txt)
-                
+
                 count += 1
                 if count >= max_files_per_repo:
                     break
                 time.sleep(0.2)
         except Exception:
             continue
-    
+
     return texts
 
 
@@ -1056,14 +1075,14 @@ def local_text_files() -> List[str]:
     d = BASE_DIR / 'sources' / 'texts'
     if not d.exists():
         return texts
-    
+
     for f in sorted(d.iterdir()):
         if f.suffix.lower() in {'.txt', '.md', '.json', '.yaml', '.yml', '.csv', '.log'}:
             try:
                 texts.append(f.read_text(encoding='utf-8', errors='ignore'))
             except Exception:
                 pass
-    
+
     return texts
 
 
@@ -1073,32 +1092,32 @@ LINK_RE = re.compile(r'\b(?:vless|vmess|trojan|ss|hy2|hysteria2?|tuic|wireguard)
 def extract_links(text: str) -> List[str]:
     if not text:
         return []
-    
+
     text = urllib.parse.unquote(text)
     links = []
-    
+
     for m in LINK_RE.finditer(text):
         url = m.group(0).strip()
         url = re.sub(r'[\)\]\}>"\'`,;]+$', '', url)
         if url:
             links.append(url)
-    
+
     return links
 
 
 def collect_texts() -> List[str]:
     texts = []
-    
+
     texts.extend(local_text_files())
-    
+
     if ENABLE_GITHUB_SEARCH:
         texts.extend(github_code_search_texts())
-    
+
     if GITHUB_TOKEN and GITHUB_REPOS:
         texts.extend(github_repo_texts())
-    
+
     texts.extend(raw_url_texts())
-    
+
     return texts
 
 
@@ -1106,119 +1125,101 @@ def collect_texts() -> List[str]:
 # Main
 # =========================
 def main():
-    print('=' * 60)
-    print('[DEBUG] Starting collector')
-    print(f'[DEBUG] BASE_DIR: {BASE_DIR}')
-    print(f'[DEBUG] OUT_DIR: {OUT_DIR}')
-    print(f'[DEBUG] GITHUB_TOKEN set: {bool(GITHUB_TOKEN)}')
-    print(f'[DEBUG] GITHUB_REPOS: {GITHUB_REPOS}')
-    print(f'[DEBUG] RAW_URLS: {RAW_URLS}')
-    print(f'[DEBUG] SEARCH_QUERIES: {SEARCH_QUERIES}')
-    print(f'[DEBUG] ALLOWED_PROTOCOLS: {ALLOWED_PROTOCOLS}')
-    print('=' * 60)
-    
     print('[INFO] Collecting source texts...')
     texts = collect_texts()
     print(f'[INFO] Source texts: {len(texts)}')
-    
-    # Отладка: показать первые 200 символов каждого текста
-    for i, t in enumerate(texts[:5]):
-        print(f'[DEBUG] Text {i}: {t[:200]}...')
-    
+
     links = []
     for t in texts:
         links.extend(extract_links(t))
-    
-    print(f'[INFO] Links found: {len(links)}')
-    
-    # Отладка: показать первые 10 ссылок
-    for i, link in enumerate(links[:10]):
-        print(f'[DEBUG] Link {i}: {link}')
-    
+
     unique_links = list(dict.fromkeys(links))
-    print(f'[INFO] Unique links: {len(unique_links)}')
-    
+    print(f'[INFO] Links found: {len(links)}, unique: {len(unique_links)}')
+
     servers = []
     seen = set()
-    
+
     for url in unique_links:
         s = parse_proxy_url(url)
         if not s:
             continue
-        
+
         fp = make_fingerprint(s)
         if fp in seen:
             continue
-        
+
         seen.add(fp)
         s['fp'] = fp
         servers.append(s)
-    
+
     print(f'[INFO] Unique parsed servers: {len(servers)}')
-    
+
     if not servers:
         write_outputs([])
         print('[WARN] No servers selected.')
         return
-    
-    # МНОГОПОТОЧНАЯ ГЕОЛОКАЦИЯ
-    print('[INFO] Resolving geolocation...')
-    ips_to_check = []
-    for s in servers:
-        ip = resolve_ip(s['address'])
-        if ip and is_public_ip(ip):
-            s['ip'] = ip
-            ips_to_check.append(ip)
-        else:
-            s['country'] = 'UN'
-            s['city'] = ''
-            s['country_name'] = ''
-    
-    if ips_to_check:
-        geo_results = get_geo_batch(ips_to_check)
-        
+
+    # Геолокация
+    if ENABLE_GEO:
+        print('[INFO] Resolving geolocation...')
+        ips_to_check = []
         for s in servers:
-            ip = s.get('ip')
-            if ip and ip in geo_results:
-                country, city, country_name = geo_results[ip]
-                s['country'] = country
-                s['city'] = city
-                s['country_name'] = country_name
-    
+            ip = resolve_ip(s['address'])
+            if ip and is_public_ip(ip):
+                s['ip'] = ip
+                ips_to_check.append(ip)
+            else:
+                s['country'] = 'UN'
+                s['city'] = ''
+                s['country_name'] = ''
+
+        if ips_to_check:
+            geo_results = get_geo_batch(ips_to_check)
+            for s in servers:
+                ip = s.get('ip')
+                if ip and ip in geo_results:
+                    country, city, country_name = geo_results[ip]
+                    s['country'] = country
+                    s['city'] = city
+                    s['country_name'] = country_name
+
     # Фильтры
     servers = [s for s in servers if passes_filters(s)]
     print(f'[INFO] Servers after filters: {len(servers)}')
-    
+
+    if not servers:
+        write_outputs([])
+        print('[WARN] No servers after filters.')
+        return
+
     # Сортировка
     servers.sort(key=pre_sort_key)
-    
-    # TCP проверка (убираем лимит кандидатов)
+
+    # TCP проверка
     if CHECK_TCP:
         print(f'[INFO] Running TCP checks for {len(servers)} servers with {TCP_WORKERS} workers...')
         servers = run_tcp_checks(servers)
         print(f'[INFO] Servers after TCP checks: {len(servers)}')
-    
-    # Проверка через ядра (РЕАЛЬНАЯ ПРОВЕРКА)
+
+    # Проверка через ядра
     if CHECK_CORES:
-        print(f'[INFO] Running core checks for {len(servers)} servers...')
-        from core_check import filter_by_core_checks
-        servers = filter_by_core_checks(servers)
-        print(f'[INFO] Servers after core checks: {len(servers)}')
-    
-    # Сортировка по скорости и задержке
+        try:
+            from core_check import filter_by_core_checks
+            print(f'[INFO] Running core checks for {len(servers)} servers...')
+            servers = filter_by_core_checks(servers)
+            print(f'[INFO] Servers after core checks: {len(servers)}')
+        except Exception as e:
+            print(f'[WARN] Core check failed: {e}')
+
+    # Финальная сортировка
     servers.sort(key=final_sort_key)
-    
+
     # Применяем лимиты
-    servers = apply_limits(
-        servers,
-        MAX_SERVERS_TOTAL,
-        MAX_SERVERS_PER_PROTOCOL,
-        US_CA_QUOTA_PERCENT,
-        MAX_DUPLICATE_IP
-    )
-    
+    servers = apply_limits(servers, MAX_SERVERS_TOTAL, MAX_SERVERS_PER_PROTOCOL,
+                           US_CA_QUOTA_PERCENT, MAX_DUPLICATE_IP)
+
     print(f'[OK] Selected servers: {len(servers)}')
-    
+
     # Вывод файлов
     write_outputs(servers)
     print(f'[OK] Output directory: {OUT_DIR}')
