@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 # Импортируем утилиты
-from geo_utils import get_geo, get_flag, resolve_ip, is_public_ip
+from geo_utils import get_geo_batch, get_flag, resolve_ip, is_public_ip
 
 # Константы
 TRUE = {'1', 'true', 'yes', 'on'}
@@ -80,12 +80,12 @@ US_CA_QUOTA_PERCENT = env_int('US_CA_QUOTA_PERCENT', 30)
 # =========================
 MAX_LATENCY_MS = env_int('MAX_LATENCY_MS', 1500)
 TCP_TIMEOUT = float(os.environ.get('TCP_TIMEOUT', '3.0'))
-TCP_WORKERS = env_int('TCP_WORKERS', 10)
-TCP_MAX_CANDIDATES = env_int('TCP_MAX_CANDIDATES', 2000)
+TCP_WORKERS = env_int('TCP_WORKERS', 50)
+TCP_MAX_CANDIDATES = env_int('TCP_MAX_CANDIDATES', 10000)
 
 CHECK_TCP = env_bool('CHECK_TCP', True)
 CHECK_CORES = env_bool('CHECK_CORES', True)
-CHECK_SPEED = env_bool('CHECK_SPEED', True)
+CHECK_SPEED = env_bool('CHECK_SPEED', False)
 MIN_SPEED_MBPS = env_int('MIN_SPEED_MBPS', 5)
 
 ENABLE_GITHUB_SEARCH = env_bool('ENABLE_GITHUB_SEARCH', True)
@@ -476,41 +476,30 @@ def run_tcp_checks(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return servers
     
     checked = []
+    total = len(servers)
+    
+    print(f'[INFO] Starting TCP checks for {total} servers with {TCP_WORKERS} workers')
     
     with ThreadPoolExecutor(max_workers=TCP_WORKERS) as ex:
         futures = {ex.submit(tcp_latency, s): s for s in servers}
+        
+        done_count = 0
         for f in as_completed(futures):
             s = futures[f]
             lat = f.result()
+            done_count += 1
+            
+            if done_count % 100 == 0:
+                print(f'[INFO] TCP progress: {done_count}/{total} ({done_count*100//total}%)')
+            
             if lat is None:
                 continue
             if lat <= MAX_LATENCY_MS:
                 s['latency_ms'] = lat
                 checked.append(s)
     
+    print(f'[OK] TCP check passed: {len(checked)}/{total} servers')
     return checked
-
-
-def check_speed(s: Dict[str, Any]) -> Optional[float]:
-    """Проверяем скорость через прокси (упрощённая версия)"""
-    if not CHECK_SPEED:
-        return None
-    
-    # Для реальной проверки нужен работающий прокси и speedtest-cli
-    # Здесь возвращаем None, чтобы пропустить проверку скорости
-    # В полной версии можно добавить реальную проверку
-    return None
-
-
-def run_core_checks(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Проверка через Xray и Sing-box"""
-    if not CHECK_CORES:
-        return servers
-    
-    # В полной версии здесь вызов core_check.py
-    # Для упрощения возвращаем все серверы
-    print(f'[INFO] Core check requested for {len(servers)} servers')
-    return servers
 
 
 # =========================
@@ -602,7 +591,7 @@ def pre_sort_key(s: Dict[str, Any]):
 
 def final_sort_key(s: Dict[str, Any]):
     lat = s.get('latency_ms')
-    speed = s.get('speed_mbps')
+    speed = s.get('speed_kbps')
     return (
         lat if lat is not None else 999999,
         -speed if speed is not None else 0,
@@ -883,7 +872,7 @@ def write_outputs(servers: List[Dict[str, Any]]) -> None:
             'country_name': s.get('country_name'),
             'city': s.get('city'),
             'latency_ms': s.get('latency_ms'),
-            'speed_mbps': s.get('speed_mbps'),
+            'speed_kbps': s.get('speed_kbps'),
             'sni': s.get('sni'),
             'flow': s.get('flow'),
         })
@@ -1117,16 +1106,37 @@ def collect_texts() -> List[str]:
 # Main
 # =========================
 def main():
+    print('=' * 60)
+    print('[DEBUG] Starting collector')
+    print(f'[DEBUG] BASE_DIR: {BASE_DIR}')
+    print(f'[DEBUG] OUT_DIR: {OUT_DIR}')
+    print(f'[DEBUG] GITHUB_TOKEN set: {bool(GITHUB_TOKEN)}')
+    print(f'[DEBUG] GITHUB_REPOS: {GITHUB_REPOS}')
+    print(f'[DEBUG] RAW_URLS: {RAW_URLS}')
+    print(f'[DEBUG] SEARCH_QUERIES: {SEARCH_QUERIES}')
+    print(f'[DEBUG] ALLOWED_PROTOCOLS: {ALLOWED_PROTOCOLS}')
+    print('=' * 60)
+    
     print('[INFO] Collecting source texts...')
     texts = collect_texts()
     print(f'[INFO] Source texts: {len(texts)}')
+    
+    # Отладка: показать первые 200 символов каждого текста
+    for i, t in enumerate(texts[:5]):
+        print(f'[DEBUG] Text {i}: {t[:200]}...')
     
     links = []
     for t in texts:
         links.extend(extract_links(t))
     
+    print(f'[INFO] Links found: {len(links)}')
+    
+    # Отладка: показать первые 10 ссылок
+    for i, link in enumerate(links[:10]):
+        print(f'[DEBUG] Link {i}: {link}')
+    
     unique_links = list(dict.fromkeys(links))
-    print(f'[INFO] Links found: {len(links)}, unique: {len(unique_links)}')
+    print(f'[INFO] Unique links: {len(unique_links)}')
     
     servers = []
     seen = set()
@@ -1151,20 +1161,29 @@ def main():
         print('[WARN] No servers selected.')
         return
     
-    # Определяем геолокацию
+    # МНОГОПОТОЧНАЯ ГЕОЛОКАЦИЯ
     print('[INFO] Resolving geolocation...')
+    ips_to_check = []
     for s in servers:
         ip = resolve_ip(s['address'])
         if ip and is_public_ip(ip):
             s['ip'] = ip
-            country, city, country_name = get_geo(ip)
-            s['country'] = country
-            s['city'] = city
-            s['country_name'] = country_name
+            ips_to_check.append(ip)
         else:
             s['country'] = 'UN'
             s['city'] = ''
             s['country_name'] = ''
+    
+    if ips_to_check:
+        geo_results = get_geo_batch(ips_to_check)
+        
+        for s in servers:
+            ip = s.get('ip')
+            if ip and ip in geo_results:
+                country, city, country_name = geo_results[ip]
+                s['country'] = country
+                s['city'] = city
+                s['country_name'] = country_name
     
     # Фильтры
     servers = [s for s in servers if passes_filters(s)]
@@ -1173,19 +1192,18 @@ def main():
     # Сортировка
     servers.sort(key=pre_sort_key)
     
-    # TCP проверка
-    if CHECK_TCP and len(servers) > TCP_MAX_CANDIDATES:
-        servers = servers[:TCP_MAX_CANDIDATES]
-    
+    # TCP проверка (убираем лимит кандидатов)
     if CHECK_TCP:
-        print('[INFO] Running TCP checks...')
+        print(f'[INFO] Running TCP checks for {len(servers)} servers with {TCP_WORKERS} workers...')
         servers = run_tcp_checks(servers)
         print(f'[INFO] Servers after TCP checks: {len(servers)}')
     
-    # Проверка через ядра
+    # Проверка через ядра (РЕАЛЬНАЯ ПРОВЕРКА)
     if CHECK_CORES:
-        print('[INFO] Running core checks...')
-        servers = run_core_checks(servers)
+        print(f'[INFO] Running core checks for {len(servers)} servers...')
+        from core_check import filter_by_core_checks
+        servers = filter_by_core_checks(servers)
+        print(f'[INFO] Servers after core checks: {len(servers)}')
     
     # Сортировка по скорости и задержке
     servers.sort(key=final_sort_key)
