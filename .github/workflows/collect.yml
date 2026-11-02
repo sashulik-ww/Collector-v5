@@ -3,15 +3,20 @@ name: collect-proxies
 on:
   workflow_dispatch:
   schedule:
-    # каждые 1.5 часа (90 минут)
+    # каждые 90 минут (1.5 часа)
     - cron: "*/90 * * * *"
 
 permissions:
   contents: write
 
+concurrency:
+  group: proxy-collect
+  cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     env:
       # Лимиты
@@ -21,31 +26,35 @@ jobs:
       MAX_RUSSIAN: "250"
       MAX_DUPLICATE_IP: "2"
       MAX_DUPLICATE_IP_WHITELIST: "3"
-      
+
       # Квоты
       US_CA_QUOTA_PERCENT: "30"
-      
+
       # Параметры проверки
       MAX_LATENCY_MS: "1500"
-      CHECK_TCP: "true"
-      CHECK_CORES: "true"
-      CHECK_SPEED: "false"
-      MIN_SPEED_MBPS: "5"
-      
-      # Workers
+      TCP_TIMEOUT: "3.0"
       TCP_WORKERS: "50"
       GEO_WORKERS: "30"
       CORE_CHECK_WORKERS: "20"
-      
+      CORE_CHECK_TIMEOUT: "10"
+      CORE_TEST_URL: "https://www.google.com/generate_204"
+
+      # Включить/выключить проверки
+      CHECK_TCP: "true"
+      CHECK_CORES: "true"
+      ENABLE_GITHUB_SEARCH: "true"
+      ENABLE_GEO: "true"
+
       # Протоколы
       ALLOWED_PROTOCOLS: "vless,vmess,trojan,hysteria2,shadowsocks"
       COMMON_FILE_PROTOCOLS: "vless,vmess,trojan,hysteria2"
       BLOCKED_PROTOCOLS: "tuic,wireguard,socks,socks5,http,https"
-      
+      BLOCKED_NETWORKS: "quic"
+
       # Фильтры
       REQUIRE_ENCRYPTED: "true"
       ALLOW_PLAIN_VMESS: "false"
-      BLOCKED_NETWORKS: "quic"
+      ALLOW_UNKNOWN_COUNTRY: "false"
 
     steps:
       - name: Checkout
@@ -59,39 +68,40 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests speedtest-cli
+          pip install requests
 
       - name: Install Xray
         run: |
-          echo "[INFO] Downloading Xray..."
-          curl -sL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o xray.zip
-          unzip -q xray.zip -d xray-bin
-          chmod +x xray-bin/xray
-          echo "$(pwd)/xray-bin" >> $GITHUB_PATH
-          echo "[OK] Xray installed"
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) XRAY_ARCH="64";;
+            aarch64) XRAY_ARCH="arm64-v8a";;
+            *) XRAY_ARCH="64";;
+          esac
+          curl -sL "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${XRAY_ARCH}.zip" -o xray.zip || true
+          if [ -f xray.zip ]; then
+            unzip -q xray.zip -d xray-bin || true
+            chmod +x xray-bin/xray || true
+            echo "$(pwd)/xray-bin" >> $GITHUB_PATH
+          fi
 
       - name: Install sing-box
         run: |
-          echo "[INFO] Downloading sing-box..."
-          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")')
-          VERSION=${VERSION#v}
-          curl -sL https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz -o singbox.tar.gz
-          tar -xzf singbox.tar.gz
-          find . -name "sing-box" -type f -exec chmod +x {} \;
-          find . -name "sing-box" -type f -exec dirname {} \; | head -1 >> $GITHUB_PATH
-          echo "[OK] sing-box installed"
-
-      - name: Verify binaries
-        run: |
-          echo "[INFO] Checking binaries..."
-          which xray || echo "[ERROR] xray not found"
-          which sing-box || echo "[ERROR] sing-box not found"
-          xray version || true
-          sing-box version || true
-
-      - name: Test collector
-        run: |
-          python test_collector.py
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64) SING_ARCH="amd64";;
+            aarch64) SING_ARCH="arm64";;
+            *) SING_ARCH="amd64";;
+          esac
+          VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//')
+          if [ -n "$VERSION" ]; then
+            curl -sL "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SING_ARCH}.tar.gz" -o singbox.tar.gz || true
+            if [ -f singbox.tar.gz ]; then
+              tar -xzf singbox.tar.gz --strip-components=1 --wildcards "*/sing-box" || true
+              chmod +x sing-box || true
+              echo "$(pwd)" >> $GITHUB_PATH
+            fi
+          fi
 
       - name: Run collector
         env:
