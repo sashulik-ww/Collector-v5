@@ -3,3 +3,5 @@
 *.session-journal
 sources/texts/private_*
 .env
+__pycache__/
+*.pyc
