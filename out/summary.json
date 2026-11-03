@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-11-03T11:05:46.763304+00:00",
+  "generated_at": "2026-11-03T12:34:01.916071+00:00",
   "total_selected": 250,
   "common_servers": 250,
   "whitelist_count": 0,
@@ -8,14 +8,16 @@
     "vless": 250
   },
   "by_country": {
-    "US": 28,
-    "CA": 3,
-    "UN": 200,
+    "US": 31,
+    "CA": 2,
+    "UN": 189,
     "MX": 1,
-    "NL": 14,
     "ES": 1,
-    "JP": 1,
-    "GB": 2
+    "FR": 1,
+    "NL": 14,
+    "GB": 6,
+    "PL": 1,
+    "DE": 4
   },
   "max_servers_total": 600,
   "us_ca_quota_percent": 30
