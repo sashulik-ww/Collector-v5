@@ -1,48 +1,133 @@
-"""
-GeoIP утилиты для определения геолокации прокси-серверов
-С таймаутами, логами прогресса и многопоточной проверкой
-"""
+#!/usr/bin/env python3
+"""GeoIP utilities for proxy collector"""
 
-import time
-import signal
-from typing import List, Dict, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import ipaddress
+import os
+import socket
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Tuple
 
-# Глобальные переменные
+import requests
+
+SESSION = requests.Session()
+SESSION.headers.update({'User-Agent': 'proxy-collector/3.0'})
+
 _GEO_CACHE: Dict[str, Dict[str, Any]] = {}
 _GEO_LOCK = threading.Lock()
 
-# Настройки (должны быть импортированы из основного скрипта)
-GEO_WORKERS = 15  # Количество workers для GeoIP проверки
+GEO_WORKERS = int(os.environ.get('GEO_WORKERS', '15'))
+
+
+def resolve_ip(host: str) -> Optional[str]:
+    """Resolve host to IP"""
+    try:
+        socket.inet_aton(host)
+        return host
+    except socket.error:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, None, family=socket.AF_INET6)
+        if infos:
+            return infos[0][4][0]
+    except Exception:
+        pass
+
+    return None
+
+
+def is_public_ip(ip: str) -> bool:
+    """Check if IP is public"""
+    try:
+        obj = ipaddress.ip_address(ip)
+        return not (
+            obj.is_private or obj.is_loopback or obj.is_link_local or
+            obj.is_reserved or obj.is_multicast or obj.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def get_geo_ipwho(ip: str) -> Tuple[str, str, str]:
+    """ipwho.is"""
+    try:
+        r = SESSION.get(f'https://ipwho.is/{ip}', timeout=8)
+        if r.ok:
+            data = r.json()
+            if data.get('success'):
+                country = data.get('country_code', 'UN')
+                city = data.get('city', '')
+                country_name = data.get('country', '')
+                return country, city, country_name
+    except Exception:
+        pass
+    return 'UN', '', ''
+
+
+def get_geo_ipapi(ip: str) -> Tuple[str, str, str]:
+    """ip-api.com"""
+    try:
+        r = SESSION.get(f'http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,city', timeout=8)
+        if r.ok:
+            data = r.json()
+            if data.get('status') == 'success':
+                country = data.get('countryCode', 'UN')
+                city = data.get('city', '')
+                country_name = data.get('country', '')
+                return country, city, country_name
+    except Exception:
+        pass
+    return 'UN', '', ''
+
+
+def get_geo_ipinfo(ip: str) -> Tuple[str, str, str]:
+    """ipinfo.io"""
+    try:
+        r = SESSION.get(f'https://ipinfo.io/{ip}/json', timeout=8)
+        if r.ok:
+            data = r.json()
+            country = data.get('country', 'UN')
+            city = data.get('city', '')
+            country_name = data.get('country', '')
+            return country, city, country_name
+    except Exception:
+        pass
+    return 'UN', '', ''
 
 
 def get_geo_single(ip: str) -> Tuple[str, str, str]:
-    """
-    Проверка геолокации одного IP
-    Возвращает: (country, city, country_name)
-    """
-    # Здесь должна быть реальная проверка GeoIP
-    # Например, через внешний API или локальную базу
-    # Возвращаем заглушку для примера
-    return ('UN', '', '')
+    """Check one IP through multiple services"""
+    country, city, country_name = get_geo_ipwho(ip)
+    if country != 'UN':
+        return country, city, country_name
+
+    country, city, country_name = get_geo_ipapi(ip)
+    if country != 'UN':
+        return country, city, country_name
+
+    country, city, country_name = get_geo_ipinfo(ip)
+    return country, city, country_name
 
 
 def get_geo_batch(ips: List[str]) -> Dict[str, Tuple[str, str, str]]:
-    """
-    Многопоточная проверка списка IP с таймаутом и логами прогресса
-    Возвращает: Dict[ip -> (country, city, country_name)]
-    """
+    """Multi-threaded IP geolocation check with timeout and progress logs"""
     results = {}
 
-    # Проверяем кэш
     to_check = []
     with _GEO_LOCK:
         for ip in ips:
             if ip in _GEO_CACHE:
                 cached = _GEO_CACHE[ip]
-                # Кэш действителен 24 часа
-                if time.time() - cached.get('ts', 0) < 3600 *, 24:
+                if time.time() - cached.get('ts', 0) < 3600 * 24:
                     results[ip] = (
                         cached.get('country', 'UN'),
                         cached.get('city', ''),
@@ -53,18 +138,18 @@ def get_geo_batch(ips: List[str]) -> Dict[str, Tuple[str, str, str]]:
             else:
                 to_check.append(ip)
 
-    # Если все результаты в кэше, возвращаем
     if not to_check:
         return results
 
     print(f'[GEO] Checking {len(to_check)} IPs with {GEO_WORKERS} workers', flush=True)
 
-    # Ограничиваем общее время GeoIP проверки
+    import signal
+
     def timeout_handler(signum, frame):
         raise TimeoutError("GeoIP check timeout")
 
     old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(600)  # 10 минут максимум на GeoIP
+    signal.alarm(600)  # 10 minutes max for GeoIP
 
     try:
         with ThreadPoolExecutor(max_workers=GEO_WORKERS) as ex:
@@ -77,232 +162,74 @@ def get_geo_batch(ips: List[str]) -> Dict[str, Tuple[str, str, str]]:
                     result = f.result()
                     results[ip] = result
 
-                    # Сохраняем в кэш
                     with _GEO_LOCK:
                         _GEO_CACHE[ip] = {
                             'country': result[0],
-                            'city': result to_check.append(ip)
-            else:
-                to_check.append(ip)
+                            'city': result[1],
+                            'country_name': result[2],
+                            'ts': time.time()
+                        }
 
-    # Если все результаты в кэше, возвращаем
-    if not to_check:
-        return results
+                    done_count += 1
+                    if done_count % 100 == 0:
+                        print(f'[GEO] Progress: {done_count}/{len(to_check)} ({done_count * 100 // len(to_check)}%)', flush=True)
+                except Exception:
+                    results[ip] = ('UN', '', '')
+    except TimeoutError:
+        print('[GEO] Timeout reached, using partial results', flush=True)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
 
-    print(f'[GEO] Checking {len(to_check)} IPs with {GEO_WORKERS} workers', flush=True)
-
-    # Ограничиваем общее время GeoIP проверки
-    def timeout_handler(signum, frame):
-        raise TimeoutError("GeoIP check timeout")
-
-    old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(600)  # 10 минут максимум на GeoIP
-
-    try:
-        with ThreadPoolExecutor(max_workers=GEO_WORKERS) as ex:
-            futures = {ex.submit(get_geo_single, ip): ip for ip in to_check}
-
-            done_count = 0
-            for f in as_completed(futures):
-                ip = futuresers)
-            print(f'[GEO] Geolocation done', flush=True)
-    else:
-        for s in servers:
-            s['country'] = 'UN'
-            s['city'] = ''
-            s['country_name'] = ''
-
-    # 5. Фильтры
-    print('[INFO] Step 5: Applying filters...', flush=True)
-    servers = [s for s in servers if passes_filters(s)]
-    print(f'[INFO] Servers after filters: {len(servers)}', flush=True)
-
-    if not servers:
-        print('[WARN] No servers after filters', flush=True)
-        write_outputs([])
-        return
-
-    # 6. Сортировка
-    servers.sort(key=pre_sort_key)
-
-    # 7. TCP проверка
-    if CHECK_TCP:
-        print(f'[INFO] Step 6: TCP checks for {min(len(servers), TCP_MAX_CANDIDATES)} servers...', flush=True)
-        if len(servers) > TCP_MAX_CANDIDATES:
-            servers = servers[:TCP_MAX_CANDIDATES]
-            print(f'[INFO] Limited to {TCP_MAX_CANDIDATES} candidates', flush=True)
-
-        servers = run_tcp_checks(servers)
-        print(f'[INFO] Servers after TCP checks: { = []
-    for url in unique_links:
-        s = parse_proxy_url(url)
-        if not s:
-            parse_errors += 1
-            continue
-
-        fp = make_fingerprint(s)
-        if fp in seen:
-            continue
-
-        seen.add(fp)
-        s['fp'] = fp
-        servers.append(s)
-
-    print(f'[INFO] Parsed servers: {len(servers)} (errors: {parse_errors})', flush=True)
-
-    if not servers:
-        print('[WARN] No valid servers parsed', flush=True)
-        write_outputs([])
-        return
-
-    # 4. Геолокация
-    if ENABLE_GEO:
-        print('[INFO] Step 4: Resolving geolocation...', flush=True)
-        ips_to_check = []
-        for s in servers:
-            ip = resolve_ip(s['address'])
-            if ip and is_public_ip(ip):
-                s['ip'] = ip
-                ips_to_check.append(ip)
-            else:
-                s['country'] = 'UN'
-                s['city'] = ''
-                s['country_name'] = ''
-
-        if ips_to_check:
-            print(f'[INFO] Checking {len(ips_to_check)} unique IPs...', flush=True)
-            geo_results = get_geo_batch(ips_to_check)
-            for s in servers:
-                ip = s.get('ip')
-                if ip and ip in geo_results:
-                    country, city, country_name = geo_results[ip]
-                    s['country'] = country
-                    s['city'] = city
-                    s['country_name'] = country_name
-            print(f'[INFO] Geolocation done', flush=True)
-    else:
-        for s in servers:
-            s['country'] = 'UN'
-            s to_check.append(ip)
-
-    # Если все результаты в кэше, возвращаем
-    if not to_check:
-        return results
-
-    print(f'[GEO] Checking {len(to_check)} IPs with {GEO_WORKERS} workers', flush=True)
-
-    # Ограничиваем общее время GeoIP проверки
-    def timeout_handler(signum, frame):
-        raise TimeoutError("GeoIP check
-    """
-    GeoIP утилиты для определения геолокации прокси-серверов
-    С таймаутами, логами прогресса и многопоточной проверкой
-    """
-
-    import time
-    import signal
-    from typing import List, Dict, Tuple, Any
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import threading
-
-    # Глобальные переменные
-    _GEO_CACHE: Dict[str, Dict[str, Any]] = {}
-    _GEO_LOCK = threading.Lock()
-
-    # Настройки (должны быть импортированы из основного скрипта)
-    GEO_WORKERS = 15  # Количество workers для GeoIP проверки
+    return results
 
 
-    def get_geo_single(ip: str) -> Tuple[str, str, str]:
-        """
-        Проверка геолокации одного IP
-        Возвращает: (country, city, country_name)
-        """
-        # Здесь должна быть реальная проверка GeoIP
-        # Например, через внешний API или локальную базу
-        # Возвращаем заглушку для примера
-        return ('UN', '', '')
+def get_geo(ip: str) -> Tuple[str, str, str]:
+    """Get geolocation for one IP"""
+    results = get_geo_batch([ip])
+    return results.get(ip, ('UN', '', ''))
 
 
-    def get_geo_batch(ips: List[str]) -> Dict[str, Tuple[str, str, str]]:
-        """
-        Многопоточная проверка списка IP с таймаутом и логами прогресса
-        Возвращает: Dict[ip -> (country, city, country_name)]
-        """
-        results = {}
-
-        # Проверяем кэш
-        to_check = []
-        with _GEO_LOCK:
-            for ip in ips:
-                if ip in _GEO_CACHE:
-                    cached = _GEO_CACHE[ip]
-                    # Кэш действителен 24 часа
-                    if time.time() - cached.get('ts', 0) < 3600 * 24:
-                        results[ip] = (
-                            cached.get('country', 'UN'),
-                            cached.get('city', ''),
-                            cached.get('country_name', '')
-                        )
-                    else:
-                        to_check.append(ip)
-                else:
-                    to_check.append(ip)
-
-        # Если все результаты в кэше, возвращаем
-        if not to_check:
-            return results
-
-        print(f'[GEO] Checking {len(to_check)} IPs with {GEO_WORKERS} workers', flush=True)
-
-        # Ограничиваем общее время GeoIP проверки
-        def timeout_handler(signum, frame):
-            raise TimeoutError("GeoIP check timeout")
-
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(600)  # 10 минут максимум на GeoIP
-
-        try:
-            with ThreadPoolExecutor(max_workers=GEO_WORKERS) as ex:
-                futures = {ex.submit(get_geo_single, ip): ip for ip in to_check}
-
-                done_count = 0
-                for f in as_completed(futures):
-                    ip = futures[f]
-                    try:
-                        result = f.result()
-                        results[ip] = result
-
-                        # Сохраняем в кэш
-                        with _GEO_LOCK:
-                            _GEO_CACHE[ip] = {
-                                'country': result[0],
-                                'city': result[1],
-                                'country_name': result[2],
-                                'ts': time.time()
-                            }
-
-                        done_count += 1
-                        if done_count % 100 == 0:
-                            print(f'[GEO] Progress: {done_count}/{len(to_check)} ({done_count * 100 // len(to_check)}%)', flush=True)
-                    except Exception:
-                        results[ip] = ('UN', '', '')
-        except TimeoutError:
-            print('[GEO] Timeout reached, using partial results', flush=True)
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-
-        return results
+COUNTRY_FLAGS = {
+    'AF': '🇦🇫', 'AX': '🇦🇽', 'AL': '🇦🇱', 'DZ': '🇩🇿', 'AS': '🇦🇸', 'AD': '🇦🇩', 'AO': '🇦🇴',
+    'AI': '🇦🇮', 'AQ': '🇦🇶', 'AG': '🇦🇬', 'AR': '🇦🇷', 'AM': '🇦🇲', 'AW': '🇦🇼', 'AU': '🇦🇺',
+    'AT': '🇦🇹', 'AZ': '🇦🇿', 'BS': '🇧🇸', 'BH': '🇧🇭', 'BD': '🇧🇩', 'BB': '🇧🇧', 'BY': '🇧🇾',
+    'BE': '🇧🇪', 'BZ': '🇧🇿', 'BJ': '🇧🇯', 'BM': '🇧🇲', 'BT': '🇧🇹', 'BO': '🇧🇴', 'BQ': '🇧🇶',
+    'BA': '🇧🇦', 'BW': '🇧🇼', 'BV': '🇧🇻', 'BR': '🇧🇷', 'IO': '🇮🇴', 'BN': '🇧🇳', 'BG': '🇧🇬',
+    'BF': '🇧🇫', 'BI': '🇧🇮', 'KH': '🇰🇭', 'CM': '🇨🇲', 'CA': '🇨🇦', 'CV': '🇨🇻', 'KY': '🇰🇾',
+    'CF': '🇨🇫', 'TD': '🇹🇩', 'CL': '🇨🇱', 'CN': '🇨🇳', 'CX': '🇨🇽', 'CC': '🇨🇨', 'CO': '🇨🇴',
+    'KM': '🇰🇲', 'CG': '🇨🇬', 'CD': '🇨🇩', 'CK': '🇨🇰', 'CR': '🇨🇷', 'CI': '🇨🇮', 'HR': '🇭🇷',
+    'CU': '🇨🇺', 'CW': '🇨🇼', 'CY': '🇨🇾', 'CZ': '🇨🇿', 'DK': '🇩🇰', 'DJ': '🇩🇯', 'DM': '🇩🇲',
+    'DO': '🇩🇴', 'EC': '🇪🇨', 'EG': '🇪🇬', 'SV': '🇸🇻', 'GQ': '🇬🇶', 'ER': '🇪🇷', 'EE': '🇪🇪',
+    'ET': '🇪🇹', 'FK': '🇫🇰', 'FO': '🇫🇴', 'FJ': '🇫🇯', 'FI': '🇫🇮', 'FR': '🇫🇷', 'GF': '🇬🇫',
+    'PF': '🇵🇫', 'TF': '🇹🇫', 'GA': '🇬🇦', 'GM': '🇬🇲', 'GE': '🇬🇪', 'DE': '🇩🇪', 'GH': '🇬🇭',
+    'GI': '🇬🇮', 'GR': '🇬🇷', 'GL': '🇬🇱', 'GD': '🇬🇩', 'GP': '🇬🇵', 'GU': '🇬🇺', 'GT': '🇬🇹',
+    'GG': '🇬🇬', 'GN': '🇬🇳', 'GW': '🇬🇼', 'GY': '🇬🇾', 'HT': '🇭🇹', 'HM': '🇭🇲', 'VA': '🇻🇦',
+    'HN': '🇭🇳', 'HK': '🇭🇰', 'HU': '🇭🇺', 'IS': '🇮🇸', 'IN': '🇮🇳', 'ID': '🇮🇩', 'IR': '🇮🇷',
+    'IQ': '🇮🇶', 'IE': '🇮🇪', 'IM': '🇮🇲', 'IL': '🇮🇱', 'IT': '🇮🇹', 'JM': '🇯🇲', 'JP': '🇯🇵',
+    'JE': '🇯🇪', 'JO': '🇯🇴', 'KZ': '🇰🇿', 'KE': '🇰🇪', 'KI': '🇰🇮', 'KP': '🇰🇵', 'KR': '🇰🇷',
+    'KW': '🇰🇼', 'KG': '🇰🇬', 'LA': '🇱🇦', 'LV': '🇱🇻', 'LB': '🇱🇧', 'LS': '🇱🇸', 'LR': '🇱🇷',
+    'LY': '🇱🇾', 'LI': '🇱🇮', 'LT': '🇱🇹', 'LU': '🇱🇺', 'MO': '🇲🇴', 'MK': '🇲🇰', 'MG': '🇲🇬',
+    'MW': '🇲🇼', 'MY': '🇲🇾', 'MV': '🇲🇻', 'ML': '🇲🇱', 'MT': '🇲🇹', 'MH': '🇲🇭', 'MQ': '🇲🇶',
+    'MR': '🇲🇷', 'MU': '🇲🇺', 'YT': '🇾🇹', 'MX': '🇲🇽', 'FM': '🇫🇲', 'MD': '🇲🇩', 'MC': '🇲🇨',
+    'MN': '🇲🇳', 'ME': '🇲🇪', 'MS': '🇲🇸', 'MA': '🇲🇦', 'MZ': '🇲🇿', 'MM': '🇲🇲', 'NA': '🇳🇦',
+    'NR': '🇳🇷', 'NP': '🇳🇵', 'NL': '🇳🇱', 'NC': '🇳🇨', 'NZ': '🇳🇿', 'NI': '🇳🇮', 'NE': '🇳🇪',
+    'NG': '🇳🇬', 'NU': '🇳🇺', 'NF': '🇳🇫', 'MP': '🇲🇵', 'NO': '🇳🇴', 'OM': '🇴🇲', 'PK': '🇵🇰',
+    'PW': '🇵🇼', 'PS': '🇵🇸', 'PA': '🇵🇦', 'PG': '🇵🇬', 'PY': '🇵🇾', 'PE': '🇵🇪', 'PH': '🇵🇭',
+    'PN': '🇵🇳', 'PL': '🇵🇱', 'PT': '🇵🇹', 'PR': '🇵🇷', 'QA': '🇶🇦', 'RE': '🇷🇪', 'RO': '🇷🇴',
+    'RU': '🇷🇺', 'RW': '🇷🇼', 'BL': '🇧🇱', 'SH': '🇸🇭', 'KN': '🇰🇳', 'LC': '🇱🇨', 'MF': '🇲🇫',
+    'PM': '🇵🇲', 'VC': '🇻🇨', 'WS': '🇼🇸', 'SM': '🇸🇲', 'ST': '🇸🇹', 'SA': '🇸🇦', 'SN': '🇸🇳',
+    'RS': '🇷🇸', 'SC': '🇸🇨', 'SL': '🇸🇱', 'SG': '🇸🇬', 'SX': '🇸🇽', 'SK': '🇸🇰', 'SI': '🇸🇮',
+    'SB': '🇸🇧', 'SO': '🇸🇴', 'ZA': '🇿🇦', 'GS': '🇬🇸', 'SS': '🇸🇸', 'ES': '🇪🇸', 'LK': '🇱🇰',
+    'SD': '🇸🇩', 'SR': '🇸🇷', 'SJ': '🇸🇯', 'SZ': '🇸🇿', 'SE': '🇸🇪', 'CH': '🇨🇭', 'SY': '🇸🇾',
+    'TW': '🇹🇼', 'TJ': '🇹🇯', 'TZ': '🇹🇿', 'TH': '🇹🇭', 'TL': '🇹🇱', 'TG': '🇹🇬', 'TK': '🇹🇰',
+    'TO': '🇹🇴', 'TT': '🇹🇹', 'TN': '🇹🇳', 'TR': '🇹🇷', 'TM': '🇹🇲', 'TC': '🇹🇨', 'TV': '🇹🇻',
+    'UG': '🇺🇬', 'UA': '🇺🇦', 'AE': '🇦🇪', 'GB': '🇬🇧', 'US': '🇺🇸', 'UM': '🇺🇲', 'UY': '🇺🇾',
+    'UZ': '🇺🇿', 'VU': '🇻🇺', 'VE': '🇻🇪', 'VN': '🇻🇳', 'VG': '🇻🇬', 'VI': '🇻🇮', 'WF': '🇼🇫',
+    'EH': '🇪🇭', 'YE': '🇾🇪', 'ZM': '🇿🇲', 'ZW': '🇿🇼',
+}
 
 
-    def get_geo_cache_size() -> int:
-        """Возвращает размер кэша GeoIP"""
-        with _GEO_LOCK:
-            return len(_GEO_CACHE)
-
-
-    def clear_geo_cache() -> None:
-        """Очищает кэш GeoIP"""
-        with _GEO_LOCK:
-            _GEO_CACHE.clear()
+def get_flag(country_code: str) -> str:
+    """Return country flag by ISO code"""
+    return COUNTRY_FLAGS.get(country_code.upper(), '🏳️')
