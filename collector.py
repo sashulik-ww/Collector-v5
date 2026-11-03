@@ -23,6 +23,15 @@ import requests
 # Configure stdout for unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
 
+# Import geo_utils at the beginning
+try:
+    from geo_utils import get_geo_batch, get_flag, resolve_ip, is_public_ip
+except ImportError:
+    def get_geo_batch(ips): return {}
+    def get_flag(cc): return '🏳️'
+    def resolve_ip(h): return None
+    def is_public_ip(ip): return True
+
 TRUE = {'1', 'true', 'yes', 'on'}
 BASE_DIR = Path(__file__).resolve().parent
 OUT_DIR = BASE_DIR / os.environ.get('OUT_DIR', 'out')
@@ -1135,19 +1144,6 @@ def collect_texts() -> List[str]:
     texts.extend(raw_url_texts())
 
     return texts
-
-
-# =========================
-# GeoIP (import from geo_utils)
-# =========================
-try:
-    from geo_utils import get_geo_batch, get_flag, resolve_ip, is_public_ip
-except ImportError:
-    # Fallback if geo_utils not available
-    def get_geo_batch(ips): return {}
-    def get_flag(cc): return '️'
-    def resolve_ip(h): return None
-    def is_public_ip(ip): return True
 
 
 # =========================
