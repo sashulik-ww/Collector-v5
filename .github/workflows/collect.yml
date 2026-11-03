@@ -3,20 +3,20 @@ name: collect-proxies
 on:
   workflow_dispatch:
   schedule:
-    # каждые 90 минут (1.5 часа)
-    - cron: "*/90 * * * *"
+    # каждые 3 часа
+    - cron: "0 */3 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: proxy-collect
+  group: proxy-collect-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       # Лимиты
