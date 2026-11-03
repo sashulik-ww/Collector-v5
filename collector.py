@@ -95,7 +95,7 @@ GEO_WORKERS = env_int('GEO_WORKERS', 15)
 TCP_MAX_CANDIDATES = env_int('TCP_MAX_CANDIDATES', 1500)
 
 CHECK_TCP = env_bool('CHECK_TCP', True)
-CHECK_CORES = env_bool('CHECK_CORES', False)
+CHECK_CORES = env_bool('CHECK_CORES', True)
 ENABLE_GEO = env_bool('ENABLE_GEO', True)
 ENABLE_GITHUB_SEARCH = env_bool('ENABLE_GITHUB_SEARCH', False)
 
