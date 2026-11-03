@@ -3,7 +3,7 @@ name: collect-proxies
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */4 * * *"
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: write
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     env:
       MAX_SERVERS_TOTAL: "600"
@@ -27,14 +27,14 @@ jobs:
       US_CA_QUOTA_PERCENT: "30"
 
       MAX_LATENCY_MS: "1500"
-      TCP_TIMEOUT: "3.0"
-      TCP_WORKERS: "40"
-      GEO_WORKERS: "25"
-      TCP_MAX_CANDIDATES: "3000"
+      TCP_TIMEOUT: "2.5"
+      TCP_WORKERS: "25"
+      GEO_WORKERS: "15"
+      TCP_MAX_CANDIDATES: "1500"
 
       CHECK_TCP: "true"
       CHECK_CORES: "false"
-      ENABLE_GITHUB_SEARCH: "true"
+      ENABLE_GITHUB_SEARCH: "false"
       ENABLE_GEO: "true"
       ALLOW_UNKNOWN_COUNTRY: "true"
 
@@ -64,9 +64,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python collector.py
+          python -u collector.py
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: proxy-lists
