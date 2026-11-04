@@ -1,25 +1,26 @@
 {
-  "generated_at": "2026-11-04T07:33:21.492604+00:00",
+  "generated_at": "2026-11-04T13:06:10.855095+00:00",
   "total_selected": 250,
   "common_servers": 250,
   "whitelist_count": 0,
-  "russian_count": 2,
+  "russian_count": 0,
   "by_protocol": {
     "vless": 250
   },
   "by_country": {
-    "US": 38,
-    "CA": 5,
-    "UN": 161,
+    "CA": 6,
+    "US": 35,
+    "UN": 169,
+    "BR": 1,
     "MX": 1,
-    "JP": 4,
-    "KR": 3,
-    "NL": 22,
-    "AU": 1,
+    "NL": 17,
+    "ES": 5,
+    "FR": 1,
     "GB": 7,
-    "FR": 4,
-    "PL": 2,
-    "RU": 2
+    "DE": 5,
+    "AM": 1,
+    "IE": 1,
+    "BE": 1
   },
   "max_servers_total": 600,
   "us_ca_quota_percent": 30
