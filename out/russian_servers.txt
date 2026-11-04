@@ -1,1 +1,2 @@
-
+vless://2771954b-3f7f-49cb-90fd-32616e90a2f3@185.98.63.6:8443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=SbVKOEMjK0sIlbwg4akyBg5mL5KZwwB-ed4eEE7YnRc&sni=apple.com#%F0%9F%87%B7%F0%9F%87%BA%20RU%2C%20Moscow
+vless://6845a59f-970b-4e1e-8e26-06a34ee663d6@185.98.63.6:8443?security=reality&encryption=none&pbk=SbVKOEMjK0sIlbwg4akyBg5mL5KZwwB-ed4eEE7YnRc&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=apple.com#%F0%9F%87%B7%F0%9F%87%BA%20RU%2C%20Moscow
